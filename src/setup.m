@@ -11,10 +11,10 @@
 #define DISK_FILENAME "arch.img"
 
 static const char *kernel_url =
-    "https://github.com/felix/msl/releases/download/v1.0.0/kernel";
+    "https://github.com/xt9y/msl/releases/download/v1.0.0/kernel";
 
 static const char *disk_url =
-    "https://github.com/felix/msl/releases/download/v1.0.0/arch.img";
+    "https://github.com/xt9y/msl/releases/download/v1.0.0/arch.img.gz";
 
 static bool download_file(const char *url, const char *path) {
     char cmd[4096];
@@ -41,6 +41,28 @@ static bool download_file(const char *url, const char *path) {
         return false;
     }
 
+    return true;
+}
+
+static bool decompress_gz(const char *gz_path, const char *out_path) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "gzip -d -c \"%s\" > \"%s\" 2>/dev/null", gz_path, out_path);
+    printf("  Decompressing...\n");
+    fflush(stdout);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "error: decompression failed\n");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(out_path, &st) != 0 || st.st_size == 0) {
+        fprintf(stderr, "error: decompressed file is empty\n");
+        return false;
+    }
+
+    unlink(gz_path);
     return true;
 }
 
@@ -73,9 +95,11 @@ bool setup_ensure(void) {
     }
 
     if (need_disk) {
-        printf("  (this may take a while — the disk image is ~2GB)\n");
-        fflush(stdout);
-        if (!download_file(disk_url, disk_path)) return false;
+        char gz_path[1024];
+        snprintf(gz_path, sizeof(gz_path), "%s.gz", disk_path);
+        if (!download_file(disk_url, gz_path)) return false;
+        printf("  -> %s\n", gz_path);
+        if (!decompress_gz(gz_path, disk_path)) return false;
         printf("  -> %s\n", disk_path);
     }
 

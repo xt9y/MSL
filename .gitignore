@@ -3,3 +3,6 @@ build/
 *.swp
 *.swo
 *~
+arch.img
+arch.img.gz
+kernel
