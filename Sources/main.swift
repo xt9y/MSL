@@ -88,7 +88,7 @@ func printUsage() {
     print("  --shell              Open an interactive shell in the VM")
     print("  --stop               Stop the VM")
     print("  --status             Check VM status")
-    print("  --setup              Download and prepare the VM disk image")
+    print("  --setup              Download and prepare the VM disk image (incl. XQuartz for GUI)")
     print("  --version            Print version info")
     print("  --help               Show this help")
 }

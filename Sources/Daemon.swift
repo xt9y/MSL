@@ -23,6 +23,8 @@ class Daemon {
         try state.writePID()
         defer { state.removePID() }
 
+        ensureDisplayBridge()
+
         print("[1/5] Creating VM configuration...")
         fflush(stdout)
         try vm.boot()

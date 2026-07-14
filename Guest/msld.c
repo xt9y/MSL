@@ -19,6 +19,29 @@
 
 static int       g_listen_fd  = -1;
 static int       g_client_fd  = -1;
+static char      g_display[64] = {0};
+
+static void probe_gateway(void) {
+    if (g_display[0]) return;
+    FILE *fp = fopen("/proc/net/route", "r");
+    if (!fp) return;
+    char line[256];
+    /* skip header */
+    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return; }
+    while (fgets(line, sizeof(line), fp)) {
+        char iface[64];
+        unsigned int dest, gw, mask;
+        if (sscanf(line, "%63s %x %x %*x %*d %*d %*d %x",
+                   iface, &dest, &gw, &mask) >= 4) {
+            if (dest == 0 && mask == 0 && gw != 0) {
+                struct in_addr addr = { .s_addr = gw };
+                snprintf(g_display, sizeof(g_display), "%s:0", inet_ntoa(addr));
+                break;
+            }
+        }
+    }
+    fclose(fp);
+}
 
 static void xwrite(int fd, const void *buf, size_t len) {
     while (len > 0) {
@@ -31,6 +54,7 @@ static void xwrite(int fd, const void *buf, size_t len) {
 
 static void serve_client(int client_fd) {
     g_client_fd = client_fd;
+    probe_gateway();
     struct timeval tv = {5, 0};
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -74,6 +98,7 @@ static void serve_client(int client_fd) {
             if (g_listen_fd > 2) close(g_listen_fd);
             if (client_fd > 2)  close(client_fd);
             setsid();
+            if (g_display[0]) setenv("DISPLAY", g_display, 1);
             /* Honor the user's login shell from /etc/passwd (so bash
                gets argv[0]="-bash" and enables readline editing), and
                fall back to /bin/bash then /bin/sh if lookup fails. */
@@ -175,6 +200,7 @@ shell_done:
         close(out_pipe[1]); close(err_pipe[1]);
         if (g_listen_fd > 2) close(g_listen_fd);
         if (client_fd > 2)   close(client_fd);
+        if (g_display[0]) setenv("DISPLAY", g_display, 1);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }

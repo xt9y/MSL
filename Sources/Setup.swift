@@ -26,6 +26,7 @@ func ensureSetup() throws {
     try? FileManager.default.removeItem(atPath: diskPath)
 
     let mke2fs = try ensureMke2fs()
+    ensureXQuartz()
     let msldPath = findMsldBinary()
 
     let tmpdir = "/tmp/msl-rootfs-\(UUID().uuidString)"
@@ -94,6 +95,7 @@ func ensureSetup() throws {
 
     [Service]
     ExecStart=/usr/local/bin/msld-wrapper.sh
+    WorkingDirectory=/root
     Restart=always
     RestartSec=5
 
@@ -262,6 +264,70 @@ private func ensureMke2fs() throws -> String {
     shell("brew install e2fsprogs 2>/dev/null")
     if let p = findMke2fs() { return p }
     throw MslError("mke2fs not found — install e2fsprogs via 'brew install e2fsprogs'")
+}
+
+private func findXQuartzApp() -> String? {
+    let candidates = [
+        "/Applications/Utilities/XQuartz.app",
+        "/Applications/XQuartz.app",
+    ]
+    for c in candidates {
+        var st = stat()
+        if stat(c, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR {
+            return c
+        }
+    }
+    return nil
+}
+
+func ensureDisplayBridge() {
+    // XQuartz only listens on a local Unix socket; the VM connects over TCP.
+    // socat bridges TCP 6000 -> /tmp/.X11-unix/X0 so the guest can reach it.
+    let x11Socket = "/tmp/.X11-unix/X0"
+    guard FileManager.default.fileExists(atPath: x11Socket) else { return }
+
+    // Check if something is already listening on 6000
+    if shell("lsof -i :6000 >/dev/null 2>&1") == 0 { return }
+
+    // Ensure socat is installed
+    if shell("which socat >/dev/null 2>&1") != 0 {
+        print("  Installing socat (for X11 TCP bridge)...")
+        fflush(stdout)
+        shell("brew install socat 2>/dev/null")
+    }
+    if shell("which socat >/dev/null 2>&1") != 0 {
+        print("  warning: socat not found — GUI apps won't display")
+        return
+    }
+
+    shell("nohup socat TCP-LISTEN:6000,reuseaddr,fork UNIX-CONNECT:\(x11Socket) >/dev/null 2>&1 &")
+    print("  -> X11 TCP bridge started (port 6000)")
+}
+
+private func ensureXQuartz() {
+    if findXQuartzApp() == nil {
+        print("  Installing XQuartz (for GUI display forwarding)...")
+        fflush(stdout)
+        shell("brew install --cask xquartz 2>&1")
+        if findXQuartzApp() == nil {
+            print("  warning: XQuartz not found — install manually from https://www.xquartz.org")
+            print("           GUI apps from the VM won't display until XQuartz is installed.")
+            return
+        }
+    }
+    print("  Starting XQuartz...")
+    shell("open -a XQuartz 2>/dev/null")
+    // Wait for the X server to come up (xhost will fail until it's ready)
+    let xhost = "/opt/X11/bin/xhost"
+    for _ in 0..<30 {
+        if shell("\(xhost) + >/dev/null 2>&1") == 0 {
+            ensureDisplayBridge()
+            print("  -> XQuartz ready (xhost +, TCP bridge on port 6000)")
+            return
+        }
+        usleep(500_000)
+    }
+    print("  warning: XQuartz started but xhost + failed — GUI apps may not display")
 }
 
 private func findMsldBinary() -> String? {
