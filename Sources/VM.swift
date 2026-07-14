@@ -111,10 +111,6 @@ class MSLVM: NSObject {
     func start() async throws {
         guard let vm = vm else { throw MslError("VM not configured") }
 
-        guard VZVirtualMachine.isSupported else {
-            throw MslError("virtualization not supported on this Mac")
-        }
-
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in

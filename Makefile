@@ -15,9 +15,8 @@ OBJC_SRCS = Sources/MSLVSOCK.m
 OBJC_HEADER = Sources/BridgingHeader.h
 
 GUEST_SRC = Guest/msld.c
-GUEST_OUT = $(BUILD_DIR)/msld
 
-all: sign
+all: sign $(BUILD_DIR)/msld
 
 $(PRODUCT): $(SWIFT_SRCS) $(OBJC_SRCS)
 	@mkdir -p $(BUILD_DIR)

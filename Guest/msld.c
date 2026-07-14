@@ -10,8 +10,6 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
 #include <pty.h>
 #include <termios.h>
 #include <pwd.h>
@@ -21,14 +19,6 @@
 
 static int       g_listen_fd  = -1;
 static int       g_client_fd  = -1;
-
-static void close_fds_above(int lowfd) {
-    int max = 1024;
-    long sc = sysconf(_SC_OPEN_MAX);
-    if (sc > 0 && sc < 1024)        max = sc;
-    else if (sc > max)              max = sc;
-    for (int fd = lowfd; fd <= max; fd++) close((int)fd);
-}
 
 static void xwrite(int fd, const void *buf, size_t len) {
     while (len > 0) {

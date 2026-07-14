@@ -1,4 +1,5 @@
 build/
+Guest/msld
 .DS_Store
 *.swp
 *.swo
