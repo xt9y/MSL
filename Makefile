@@ -19,17 +19,17 @@ GUEST_OUT = $(BUILD_DIR)/msld
 
 all: sign
 
-$(GUEST_OUT): $(GUEST_SRC)
-	@mkdir -p $(BUILD_DIR)
-	aarch64-linux-musl-gcc -static -Os -s -o $@ $^
-
-$(PRODUCT): $(SWIFT_SRCS) $(OBJC_SRCS) $(GUEST_OUT)
+$(PRODUCT): $(SWIFT_SRCS) $(OBJC_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(SWIFTC) $(SWIFT_FLAGS) \
 		-import-objc-header $(OBJC_HEADER) \
 		-o $@ \
 		$(SWIFT_SRCS) $(OBJC_SRCS)
 	@echo "Build complete: $(PRODUCT)"
+
+$(BUILD_DIR)/msld: $(GUEST_SRC)
+	@mkdir -p $(BUILD_DIR)
+	aarch64-linux-musl-gcc -static -Os -s -o $@ $^
 
 sign: $(PRODUCT)
 	codesign --entitlements Resources/msl.entitlements \
