@@ -38,32 +38,7 @@ sign: $(PRODUCT)
 		$(PRODUCT)
 	@echo "Signed: $(PRODUCT)"
 
-run: sign
-	$(BUILD_DIR)/msl $(ARGS)
-
 clean:
 	rm -rf $(BUILD_DIR)
 
-VERSION != awk -F'"' '/^let MSLVersion/ {print $$2}' Sources/Setup.swift
-
-release: sign
-	git add -A
-	git commit -q -m "Release v$(VERSION)" 2>/dev/null || true
-	git push origin main
-	git tag -f v$(VERSION)
-	git push origin v$(VERSION) -f
-	@echo "Released v$(VERSION)"
-
-homebrew-upload: release
-	[ -n "$$GH_TOKEN" ] || { echo "Error: GH_TOKEN not set. Add to ~/.zshrc or run: export GH_TOKEN=your_token"; exit 1; }; \
-	rm -rf /tmp/homebrew-msl; \
-	git clone https://felixjaschul:$$GH_TOKEN@github.com/xt9y/homebrew-msl.git /tmp/homebrew-msl; \
-	git archive --format=tar.gz -o /tmp/msl-$(VERSION).tar.gz --prefix=msl-$(VERSION)/ v$(VERSION); \
-	SHA=$$(shasum -a 256 /tmp/msl-$(VERSION).tar.gz | cut -d' ' -f1); \
-	sed -i '' "s|url \".*\"|url \"https://github.com/xt9y/msl/archive/refs/tags/v$(VERSION).tar.gz\"|" /tmp/homebrew-msl/Formula/msl.rb; \
-	sed -i '' "s|sha256 \".*\"|sha256 \"$$SHA\"|" /tmp/homebrew-msl/Formula/msl.rb; \
-	cd /tmp/homebrew-msl && git add Formula/msl.rb && git commit -m "Update msl to v$(VERSION)" && git push; \
-	rm -f /tmp/msl-$(VERSION).tar.gz; \
-	echo "Homebrew tap updated to v$(VERSION)"
-
-.PHONY: all sign run clean release homebrew-upload
+.PHONY: all sign clean
