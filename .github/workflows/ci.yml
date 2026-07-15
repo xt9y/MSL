@@ -75,6 +75,15 @@ jobs:
       - name: Install e2fsprogs
         run: brew install e2fsprogs
 
+      - name: Check virtualization support
+        id: check-virt
+        run: |
+          if ./build/msl check-virt; then
+            echo "virt=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "virt=no" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run setup
         run: |
           echo "--- Setup ---"
@@ -82,13 +91,14 @@ jobs:
         timeout-minutes: 30
 
       - name: "Boot VM"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           echo "--- Starting VM ---"
           ./build/msl start
         timeout-minutes: 5
 
       - name: Upload daemon log (always)
-        if: always()
+        if: always() && steps.check-virt.outputs.virt == 'yes'
         uses: actions/upload-artifact@v4
         with:
           name: daemon-log
@@ -96,6 +106,7 @@ jobs:
           retention-days: 7
 
       - name: "Test exec: basic command"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           result=$(./build/msl exec "uname -a" 2>&1)
           echo "$result"
@@ -103,6 +114,7 @@ jobs:
           echo "PASS: uname -a"
 
       - name: "Test exec: shell pipe"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           result=$(./build/msl exec "echo hello | cat" 2>&1)
           echo "$result"
@@ -110,6 +122,7 @@ jobs:
           echo "PASS: shell pipe"
 
       - name: "Test exec: system booted"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           result=$(./build/msl exec "cat /proc/1/comm" 2>&1)
           echo "$result"
@@ -117,6 +130,7 @@ jobs:
           echo "PASS: system booted"
 
       - name: "Test exec: package manager"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           result=$(./build/msl exec "pacman -Qi base 2>&1 | head -3" 2>&1)
           echo "$result"
@@ -124,6 +138,7 @@ jobs:
           echo "PASS: pacman"
 
       - name: "Test exec: exit code propagation"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           ./build/msl exec "exit 42" 2>&1
           rc=$?
@@ -131,6 +146,7 @@ jobs:
           echo "PASS: exit code 42"
 
       - name: "Test shell (non-interactive)"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           result=$(echo "echo hello_shell; exit" | ./build/msl shell 2>&1)
           echo "$result"
@@ -138,6 +154,7 @@ jobs:
           echo "PASS: shell (non-interactive)"
 
       - name: "Test status"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           status=$(./build/msl status 2>&1)
           echo "$status"
@@ -145,6 +162,7 @@ jobs:
           echo "PASS: status"
 
       - name: "Test exec after boot stress"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           for i in 1 2 3 4 5; do
             result=$(./build/msl exec "echo concurrent_test_$i" 2>&1)
@@ -153,6 +171,7 @@ jobs:
           echo "PASS: concurrent exec"
 
       - name: "Stop VM"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           ./build/msl stop
           sleep 2
@@ -162,6 +181,7 @@ jobs:
           echo "PASS: stop"
 
       - name: "Restart and verify clean state"
+        if: steps.check-virt.outputs.virt == 'yes'
         run: |
           ./build/msl start
           sleep 5
