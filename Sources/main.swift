@@ -239,19 +239,24 @@ func main() {
         startDaemonInBackground()
 
     case "--start-daemon":
-        // Internal: actual daemon loop (launched in background by 'start')
+        mslLog("daemon starting")
         let daemon = Daemon(dataDir: dataDir)
+        mslLog("Daemon init done")
         DispatchQueue.main.async {
             Task {
                 do {
+                    mslLog("daemon.run() starting")
                     try await daemon.run()
+                    mslLog("daemon.run() returned cleanly")
                 } catch {
                     mslLog("daemon error: \(error.localizedDescription)")
                 }
                 CFRunLoopStop(CFRunLoopGetMain())
             }
         }
+        mslLog("starting CFRunLoop")
         CFRunLoopRun()
+        mslLog("CFRunLoop exited")
         exit(0)
 
     case "exec":
