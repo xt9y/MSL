@@ -102,10 +102,32 @@ func printUsage() {
     print("  --stop               Stop the VM")
     print("  --status             Check VM status")
     print("  --setup              Download and prepare the VM disk image (incl. XQuartz for GUI)")
+    print("    --disk-size N / -ds N    Disk image size in GB (default: 8)")
+    print("    --ram-size  N / -rs N    RAM size in GB (default: 2)")
+    print("    --cpu-cores N / -cc N    Number of vCPUs (default: 2)")
     print("  --upgrade            Run pacman -Syu in the VM (update all guest packages)")
     print("  --uninstall          Remove all msl data (~/.msl dir, ~GB of disk images)")
     print("  --version            Print version info")
     print("  --help               Show this help")
+}
+
+func parseSetupFlags(_ args: [String]) -> (Int, Int, Int) {
+    var diskSize = 8, ramSize = 2, cpuCores = 2
+    var i = 2
+    while i < args.count {
+        switch args[i] {
+        case "--disk-size", "-ds":
+            if i + 1 < args.count, let v = Int(args[i + 1]) { diskSize = v; i += 1 }
+        case "--ram-size", "-rs":
+            if i + 1 < args.count, let v = Int(args[i + 1]) { ramSize = v; i += 1 }
+        case "--cpu-cores", "-cc":
+            if i + 1 < args.count, let v = Int(args[i + 1]) { cpuCores = v; i += 1 }
+        default:
+            break
+        }
+        i += 1
+    }
+    return (diskSize, ramSize, cpuCores)
 }
 
 func main() {
@@ -125,8 +147,9 @@ func main() {
         print("macOS Subsystem for Linux")
 
     case "--setup":
+        let (ds, rs, cc) = parseSetupFlags(args)
         do {
-            try ensureSetup()
+            try ensureSetup(diskSizeGB: ds, ramSizeGB: rs, cpuCores: cc)
         } catch {
             print("\(error.localizedDescription)")
             mslLog("setup failed: \(error.localizedDescription)")
@@ -135,9 +158,10 @@ func main() {
 
     case "--start":
         if !isSetupComplete() {
+            let (ds, rs, cc) = parseSetupFlags(args)
             print("First-time setup required. Downloading Arch Linux ARM...")
             do {
-                try ensureSetup()
+                try ensureSetup(diskSizeGB: ds, ramSizeGB: rs, cpuCores: cc)
             } catch {
                 print("\(error.localizedDescription)")
                 mslLog("setup failed: \(error.localizedDescription)")

@@ -6,3 +6,4 @@ Guest/msld
 *.swp
 *.swo
 *~
+Sources/Version.swift
