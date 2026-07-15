@@ -14,11 +14,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install musl cross-compiler & build guest daemon
+      - name: Cache musl cross-compiler
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: /tmp/aarch64-linux-musl-cross
+          key: musl-cross-v1
+
+      - name: Install musl cross-compiler
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         run: |
           curl -sL 'https://musl.cc/aarch64-linux-musl-cross.tgz' | tar xz -C /tmp
-          export PATH="/tmp/aarch64-linux-musl-cross/bin:$PATH"
-          aarch64-linux-musl-gcc -static -Os -s -o build/msld Guest/msld.c
+
+      - name: Build guest daemon
+        run: |
+          /tmp/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc -static -Os -s -o build/msld Guest/msld.c
           file build/msld
 
       - name: Build host binary
@@ -43,12 +53,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install musl cross-compiler, e2fsprogs & build guest daemon
+      - name: Cache musl cross-compiler
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: /tmp/aarch64-linux-musl-cross
+          key: musl-cross-v1
+
+      - name: Install musl cross-compiler
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         run: |
           curl -sL 'https://musl.cc/aarch64-linux-musl-cross.tgz' | tar xz -C /tmp
-          export PATH="/tmp/aarch64-linux-musl-cross/bin:$PATH"
+
+      - name: Install e2fsprogs & build guest daemon
+        run: |
           brew install e2fsprogs
-          aarch64-linux-musl-gcc -static -Os -s -o build/msld Guest/msld.c
+          /tmp/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc -static -Os -s -o build/msld Guest/msld.c
 
       - name: Build host binary
         run: make
