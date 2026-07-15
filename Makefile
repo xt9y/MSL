@@ -38,24 +38,31 @@ clean:
 # Release: commit, tag, push msl repo, then update & push homebrew tap.
 #
 # Usage:
-#   make release MSG="v1.0.8: fix {...}"
+#   make release MSG="v1.1.0: production hardening"
 #
 # What it does:
 #   1. Reads the version from Sources/Setup.swift (MSLVersion)
-#   2. Commits all staged changes with MSG
-#   3. Pushes to origin and tags v<version>
-#   4. Downloads the new GitHub tarball and computes sha256
-#   5. Clones/pulls homebrew-msl tap at /tmp/homebrew-msl
-#   6. Updates url + sha256 in Formula/msl.rb and Formula/msld.rb
-#   7. Commits and pushes the tap
+#   2. Fails if MSLVersion doesn't match the latest git tag (version drift)
+#   3. Commits all staged changes with MSG
+#   4. Pushes to origin and tags v<version>
+#   5. Downloads the new GitHub tarball and computes sha256
+#   6. Clones/pulls homebrew-msl tap at /tmp/homebrew-msl
+#   7. Updates url + sha256 in Formula/msl.rb and Formula/msld.rb
+#   8. Commits and pushes the tap
 #
 # Prerequisites:
 #   - Bump MSLVersion in Sources/Setup.swift BEFORE running
+#
+# Notes:
+# - Code signing uses ad-hoc identity (--sign -) because msl doesn't have
+#   a paid Apple Developer ID. Users may see a Gatekeeper warning on first
+#   run. To fix permanently: obtain a Developer ID, replace --sign - with
+#   --sign "Developer ID Application: ...", and notarize the binary.
 # ─────────────────────────────────────────────────────────────────────
-release:
-	git add -A
+release: verify-version
 	@VER=$$(grep -o 'MSLVersion = "[^"]*"' Sources/Setup.swift | grep -o '[0-9]*\.[0-9]*\.[0-9]*'); \
 	echo "Releasing v$$VER ..."; \
+	git add -A; \
 	git commit -m "$(MSG)"; \
 	git push; \
 	git tag "v$$VER"; \
@@ -74,4 +81,15 @@ release:
 	git commit -m "$(MSG)" && git push; \
 	echo "Done: v$$VER published to homebrew."
 
-.PHONY: all sign clean release
+# Verify MSLVersion in Setup.swift matches the latest git tag.
+# Prevents version drift where --version lies about the actual release.
+verify-version:
+	@VER=$$(grep -o 'MSLVersion = "[^"]*"' Sources/Setup.swift | grep -o '[0-9]*\.[0-9]*\.[0-9]*'); \
+	LATEST_TAG=$$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//'); \
+	if [ -n "$$LATEST_TAG" ] && [ "$$VER" = "$$LATEST_TAG" ]; then \
+		echo "ERROR: MSLVersion ($$VER) matches latest tag ($$LATEST_TAG). Bump it first!"; \
+		exit 1; \
+	fi; \
+	echo "Version OK: $$VER (latest tag: $$LATEST_TAG)"
+
+.PHONY: all sign clean release verify-version

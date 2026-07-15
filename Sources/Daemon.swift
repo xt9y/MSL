@@ -1,4 +1,7 @@
 import Foundation
+import Virtualization
+
+var globalDaemon: Daemon?
 
 class Daemon {
     let vm: MSLVM
@@ -13,6 +16,23 @@ class Daemon {
         self.vm = MSLVM(dataDir: dataDir)
         self.state = DaemonState(dataDir: dataDir)
         self.ipc = IPCServer(path: "\(dataDir)/msld.sock")
+
+        globalDaemon = self
+        signal(SIGTERM) { _ in globalDaemon?.requestStop() }
+        signal(SIGINT) { _ in globalDaemon?.requestStop() }
+    }
+
+    func requestStop() {
+        mslLog("received shutdown signal, stopping...")
+        Task {
+            do {
+                try await vm.stop()
+            } catch {
+                mslLog("vm.stop error during signal shutdown: \(error.localizedDescription)")
+            }
+            shouldKeepRunning = false
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
     }
 
     func run() async throws {
@@ -34,6 +54,7 @@ class Daemon {
         do {
             try await vm.start()
         } catch {
+            mslLog("vm.start failed: \(error.localizedDescription)")
             print("vm.start failed: \(error.localizedDescription)")
             throw error
         }
@@ -42,14 +63,13 @@ class Daemon {
         do {
             try await waitForGuest(timeout: 120)
         } catch {
+            mslLog("waitForGuest failed: \(error.localizedDescription)")
             print("waitForGuest failed: \(error.localizedDescription)")
             throw error
         }
 
         print("VM ready")
 
-        // Ensure the pacman keyring is initialized before serving
-        // so every fresh boot can run pacman without manual setup.
         await ensurePacmanKeyring()
 
         print("Listening on \(dataDir)/msld.sock")
@@ -64,6 +84,8 @@ class Daemon {
             ensureDisplayBridge()
             try await Task.sleep(nanoseconds: 30 * NSEC_PER_SEC)
         }
+
+        mslLog("daemon shutting down")
     }
 
     private func ensurePacmanKeyring() async {
@@ -78,7 +100,9 @@ class Daemon {
         if code == 0 {
             print("  -> pacman keyring ready")
         } else {
-            print("warning: pacman-key init failed (exit \(code)): \(String(data: out, encoding: .utf8) ?? "")")
+            let msg = "warning: pacman-key init failed (exit \(code)): \(String(data: out, encoding: .utf8) ?? "")"
+            print(msg)
+            mslLog(msg)
         }
     }
 
@@ -113,14 +137,12 @@ class Daemon {
             vm.connectVsock(port: 9999) { [self] result in
                 switch result {
                 case .success(let (handle, vsockFd)):
-                    // Move relay off the main queue so --exec / --stop / --status
-                    // and VM delegate callbacks stay live while a shell is open.
                     DispatchQueue.global().async { [self] in
+                        if !writeMslToken(vsockFd) { close(client); return }
                         var mode: UInt8 = 0x01
                         _ = write(vsockFd, &mode, 1)
                         var ok: UInt8 = 1
                         _ = write(client, &ok, 1)
-                        // Relay — poll each fd with short timeout
                         let bufsize = 65536
                         var buf = [UInt8](repeating: 0, count: bufsize)
                         let cliFD = client, vsockFD = vsockFd
@@ -174,6 +196,7 @@ class Daemon {
         while Date() < deadline {
             do {
                 let (handle, fd) = try await vm.connectVsock(port: 9999)
+                if !writeMslToken(fd) { throw MslError("token write failed") }
                 var mode: UInt8 = 0x00
                 var zero: UInt32 = 0
                 write(fd, &mode, 1)
@@ -223,6 +246,9 @@ class Daemon {
         case "status":
             handleStatus(send: send)
 
+        case "upgrade":
+            handleUpgrade(send: send)
+
         default:
             sendError(send, message: "unknown command: \(cmd)")
             sendDone(send)
@@ -230,15 +256,17 @@ class Daemon {
     }
 
     private func handleExec(command: String, send: @escaping (Data) -> Void) {
-        // connectVsock is invoked on the VZ queue (main). The blocking I/O
-        // (write/read/poll) below must NOT run on main, otherwise a long
-        // guest command freezes --stop / --status / VM delegate callbacks.
-        // Hop to a background queue as soon as we have the fd.
         vm.connectVsock(port: 9999) { [self] result in
             DispatchQueue.global().async { [self] in
                 switch result {
                 case .success(let (handle, fd)):
                     defer { DispatchQueue.main.async { self.vm.closeVsock(handle: handle) } }
+
+                    if !writeMslToken(fd) {
+                        self.sendError(send, message: "VSOCK auth token write failed")
+                        self.sendDone(send)
+                        return
+                    }
 
                     var reqData = Data()
                     reqData.append(contentsOf: [0x00])
@@ -252,9 +280,6 @@ class Daemon {
                         written += n
                     }
 
-                    // Read with a true wall-clock budget via poll, so a slow/dribbling
-                    // guest cannot wedge this forever. 5 minutes is plenty for the
-                    // longest expected command (e.g. pacman -Syu on first run).
                     let totalBudgetSeconds: Double = 300
                     let deadline = Date().addingTimeInterval(totalBudgetSeconds)
                     var outBuf = [UInt8](repeating: 0, count: 65536)
@@ -320,6 +345,19 @@ class Daemon {
         }
         sendExitCode(send, code: 0)
         sendDone(send)
+    }
+
+    private func handleUpgrade(send: @escaping (Data) -> Void) {
+        Task {
+            do {
+                let (out, code) = await vm.execOnGuest("pacman -Syu --noconfirm", timeout: 300)
+                if !out.isEmpty {
+                    sendOutput(send, data: out)
+                }
+                sendExitCode(send, code: code)
+                sendDone(send)
+            }
+        }
     }
 
     private func makeFrame(type: MessageType, payload: Data) -> Data {

@@ -2,6 +2,14 @@ import Foundation
 
 let dataDir = setupDataDir()
 var savedTermios = termios()
+var needTerminalRestore = false
+
+func restoreTerminal() {
+    if needTerminalRestore {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &savedTermios)
+        needTerminalRestore = false
+    }
+}
 
 func runShell() {
     signal(SIGPIPE, SIG_IGN)
@@ -42,6 +50,11 @@ func runShell() {
         raw.c_cflag &= ~tcflag_t(CSIZE | PARENB)
         raw.c_cflag |= tcflag_t(CS8)
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
+        needTerminalRestore = true
+        // Restore terminal on fatal signals so the user isn't left with a broken tty
+        signal(SIGTERM) { _ in restoreTerminal(); exit(130) }
+        signal(SIGINT) { _ in restoreTerminal(); exit(130) }
+        signal(SIGHUP) { _ in restoreTerminal(); exit(129) }
     }
 
     var running = true
@@ -76,11 +89,11 @@ func runShell() {
             } else { running = false }
         } else if r2 < 0 { break }
     }
-    if isTTY { tcsetattr(STDIN_FILENO, TCSAFLUSH, &savedTermios) }
+    restoreTerminal()
 }
 
 func printUsage() {
-    print("Usage: msl --start | --stop | --status | --exec <command> | --shell | --setup | --version")
+    print("Usage: msl --start | --stop | --status | --exec <command> | --shell | --setup | --upgrade | --uninstall | --version")
     print()
     print("Options:")
     print("  --start              Start the VM daemon (auto-setup if needed)")
@@ -89,6 +102,8 @@ func printUsage() {
     print("  --stop               Stop the VM")
     print("  --status             Check VM status")
     print("  --setup              Download and prepare the VM disk image (incl. XQuartz for GUI)")
+    print("  --upgrade            Run pacman -Syu in the VM (update all guest packages)")
+    print("  --uninstall          Remove all msl data (~/.msl dir, ~GB of disk images)")
     print("  --version            Print version info")
     print("  --help               Show this help")
 }
@@ -114,6 +129,7 @@ func main() {
             try ensureSetup()
         } catch {
             print("\(error.localizedDescription)")
+            mslLog("setup failed: \(error.localizedDescription)")
             exit(1)
         }
 
@@ -124,6 +140,7 @@ func main() {
                 try ensureSetup()
             } catch {
                 print("\(error.localizedDescription)")
+                mslLog("setup failed: \(error.localizedDescription)")
                 exit(1)
             }
         }
@@ -135,6 +152,7 @@ func main() {
                     try await daemon.run()
                 } catch {
                     print("error: \(error.localizedDescription)")
+                    mslLog("daemon error: \(error.localizedDescription)")
                 }
                 CFRunLoopStop(CFRunLoopGetMain())
             }
@@ -172,6 +190,7 @@ func main() {
             exit(Int32(exitCode))
         } catch {
             print("error: \(error.localizedDescription)")
+            mslLog("exec failed: \(error.localizedDescription)")
             exit(1)
         }
 
@@ -187,6 +206,7 @@ func main() {
             print("VM stopped")
         } catch {
             print("error: \(error.localizedDescription)")
+            mslLog("stop failed: \(error.localizedDescription)")
             exit(1)
         }
 
@@ -196,6 +216,41 @@ func main() {
             print("msld is running (pid \(state.readPID() ?? 0))")
         } else {
             print("msld is not running")
+        }
+
+    case "--upgrade":
+        let client = IPCClient(path: "\(dataDir)/msld.sock")
+        do {
+            let req: [String: Any] = ["cmd": "upgrade"]
+            let reqData = try JSONSerialization.data(withJSONObject: req)
+            let messages = try client.send(request: reqData)
+            for msg in messages {
+                switch msg.type {
+                case .output:
+                    FileHandle.standardOutput.write(msg.data)
+                case .error:
+                    FileHandle.standardError.write(msg.data)
+                case .exitCode, .done:
+                    break
+                }
+            }
+        } catch {
+            print("error: \(error.localizedDescription)")
+            mslLog("upgrade failed: \(error.localizedDescription)")
+            exit(1)
+        }
+
+    case "--uninstall":
+        let d = setupDataDir()
+        print("Removing msl data directory: \(d)")
+        do {
+            try FileManager.default.removeItem(atPath: d)
+            print("Done. ~/.msl removed.")
+            print("To remove the msl binary: brew uninstall msl msld")
+            print("To remove the tap: brew untap xt9y/msl")
+        } catch {
+            print("error: \(error.localizedDescription)")
+            exit(1)
         }
 
     default:
