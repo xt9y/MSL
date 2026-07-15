@@ -35,4 +35,10 @@ $(PRODUCT): gen-version $(SWIFT_SRCS) $(OBJC_SRCS)
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean gen-version
+DEV_ID ?= -
+
+sign: $(PRODUCT)
+	codesign --entitlements Resources/msl.entitlements \
+		--force --sign "$(DEV_ID)" "$(PRODUCT)" 2>/dev/null || true
+
+.PHONY: all clean gen-version sign
