@@ -1,3 +1,9 @@
+# GitHub Actions macOS runners are themselves virtualized and lack nested
+# virtualization support — Apple's VZVirtualMachine cannot boot a guest VM
+# here.  All tests that require a running VM (exec, shell, stop, restart)
+# are gated behind `msl check-virt` and skipped when unavailable.
+# These tests pass on real Apple Silicon Mac hardware.
+
 name: "Build & Integration Test"
 
 on:
@@ -9,6 +15,7 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,8 +87,10 @@ jobs:
         run: |
           if ./build/msl check-virt; then
             echo "virt=yes" >> "$GITHUB_OUTPUT"
+            echo "VIRT=yes" >> "$GITHUB_ENV"
           else
             echo "virt=no" >> "$GITHUB_OUTPUT"
+            echo "VIRT=no" >> "$GITHUB_ENV"
           fi
 
       - name: Run setup
@@ -90,23 +99,24 @@ jobs:
           ./build/msl setup --disk-size 6 --ram-size 2 --cpu-cores 2
         timeout-minutes: 30
 
+      - name: VM tests (skipped on GitHub Actions)
+        if: env.VIRT == 'no'
+        run: |
+          echo "──────────────────────────────────────────────────"
+          echo "  Virtualization: not supported on this runner"
+          echo "  VM boot/exec/shell/stop/restart tests skipped."
+          echo "  These require real Apple Silicon Mac hardware."
+          echo "──────────────────────────────────────────────────"
+
       - name: "Boot VM"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           echo "--- Starting VM ---"
           ./build/msl start
         timeout-minutes: 5
 
-      - name: Upload daemon log (always)
-        if: always() && steps.check-virt.outputs.virt == 'yes'
-        uses: actions/upload-artifact@v4
-        with:
-          name: daemon-log
-          path: /tmp/msl-daemon.log
-          retention-days: 7
-
       - name: "Test exec: basic command"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           result=$(./build/msl exec "uname -a" 2>&1)
           echo "$result"
@@ -114,7 +124,7 @@ jobs:
           echo "PASS: uname -a"
 
       - name: "Test exec: shell pipe"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           result=$(./build/msl exec "echo hello | cat" 2>&1)
           echo "$result"
@@ -122,7 +132,7 @@ jobs:
           echo "PASS: shell pipe"
 
       - name: "Test exec: system booted"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           result=$(./build/msl exec "cat /proc/1/comm" 2>&1)
           echo "$result"
@@ -130,7 +140,7 @@ jobs:
           echo "PASS: system booted"
 
       - name: "Test exec: package manager"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           result=$(./build/msl exec "pacman -Qi base 2>&1 | head -3" 2>&1)
           echo "$result"
@@ -138,7 +148,7 @@ jobs:
           echo "PASS: pacman"
 
       - name: "Test exec: exit code propagation"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           ./build/msl exec "exit 42" 2>&1
           rc=$?
@@ -146,7 +156,7 @@ jobs:
           echo "PASS: exit code 42"
 
       - name: "Test shell (non-interactive)"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           result=$(echo "echo hello_shell; exit" | ./build/msl shell 2>&1)
           echo "$result"
@@ -154,7 +164,7 @@ jobs:
           echo "PASS: shell (non-interactive)"
 
       - name: "Test status"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           status=$(./build/msl status 2>&1)
           echo "$status"
@@ -162,7 +172,7 @@ jobs:
           echo "PASS: status"
 
       - name: "Test exec after boot stress"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           for i in 1 2 3 4 5; do
             result=$(./build/msl exec "echo concurrent_test_$i" 2>&1)
@@ -171,7 +181,7 @@ jobs:
           echo "PASS: concurrent exec"
 
       - name: "Stop VM"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           ./build/msl stop
           sleep 2
@@ -181,7 +191,7 @@ jobs:
           echo "PASS: stop"
 
       - name: "Restart and verify clean state"
-        if: steps.check-virt.outputs.virt == 'yes'
+        if: env.VIRT == 'yes'
         run: |
           ./build/msl start
           sleep 5

@@ -113,6 +113,7 @@ func printHelp() {
     print("  exec <command>     Run a command in the VM")
     print("  setup              Download and prepare the VM disk image")
     print("  uninstall          Remove all msl data")
+    print("  check-virt         Check if virtualization is supported")
     print("  version            Show version")
     print("  help               Show this help")
     print()
