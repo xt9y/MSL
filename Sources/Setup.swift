@@ -209,7 +209,7 @@ func ensureSetup() throws {
     print("\nSetup complete.\n")
 }
 
-let MSLVersion = "1.0.0"
+let MSLVersion = "1.0.1"
 
 func setupDataDir() -> String {
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
@@ -363,7 +363,7 @@ private func ensureMsldBinary() -> String? {
         let outPath = "\(NSTemporaryDirectory())msld-\(UUID().uuidString)"
         let srcCandidates = [
             "\(selfDir)/../Guest/msld.c",
-            "\(selfDir)/../share/msl/Guest/msld.c",
+            "\(selfDir)/../share/msl/msld.c",
         ]
         for src in srcCandidates {
             let expanded = (src as NSString).standardizingPath
