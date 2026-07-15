@@ -209,7 +209,7 @@ func ensureSetup() throws {
     print("\nSetup complete.\n")
 }
 
-let MSLVersion = "1.0.6"
+let MSLVersion = "1.0.7"
 
 func setupDataDir() -> String {
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
