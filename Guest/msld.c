@@ -166,14 +166,11 @@ shell_done:
         return;
     }
 
+    if (mode != 0x00) return;
+
     uint32_t cmd_len;
     uint8_t len_buf[4];
-    if (mode == 0x00) {
-        n = read(client_fd, len_buf, 4);
-    } else {
-        len_buf[0] = mode;
-        n = read(client_fd, len_buf + 1, 3);
-    }
+    n = read(client_fd, len_buf, 4);
     if (n != 4) return;
     cmd_len = ntohl(*(uint32_t *)len_buf);
     if (cmd_len == 0 || cmd_len > BUF_SIZE - 1) return;
