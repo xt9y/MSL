@@ -23,10 +23,22 @@ msl --setup
 msl --start       # boot the VM
 msl --shell       # interactive shell
 msl --exec "cmd"  # run a command
+msl --upgrade     # update all guest packages (pacman -Syu)
 msl --stop        # stop the VM
 msl --status      # check if running
+msl --uninstall   # remove all msl data (~/.msl)
 msl --version     # show version
 ```
+
+## Configuration
+
+CPU and memory are configurable via environment variables:
+
+```bash
+MSL_CPU=4 MSL_MEMORY_MB=4096 msl --start   # 4 vCPU, 4GB RAM
+```
+
+Defaults: 2 vCPU, 2048MB RAM.
 
 ## Directory sharing
 

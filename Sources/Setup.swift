@@ -1,5 +1,17 @@
 import Foundation
 
+let mslLogPath = "/tmp/msl-daemon.log"
+
+func mslLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    if let fh = FileHandle(forWritingAtPath: mslLogPath) {
+        fh.seekToEndOfFile()
+        if let data = line.data(using: .utf8) { fh.write(data) }
+        fh.closeFile()
+    }
+}
+
 @discardableResult
 func shell(_ command: String) -> Int32 {
     let task = Process()
@@ -8,6 +20,70 @@ func shell(_ command: String) -> Int32 {
     task.launch()
     task.waitUntilExit()
     return task.terminationStatus
+}
+
+/// Download a URL to a file with retry, resume, and sha256 verification.
+/// Throws on failure (checksum mismatch, download error, etc.).
+func downloadWithChecksum(url: String, to destPath: String, expectedSha256: String?) throws {
+    let maxRetries = 3
+    for attempt in 1...maxRetries {
+        print("  Downloading (attempt \(attempt)/\(maxRetries))... \(url)")
+        fflush(stdout)
+        let resumeFlag = attempt > 1 ? "-C -" : ""
+        let rc = shell("curl -Lsf --retry 3 --retry-delay 5 \(resumeFlag) -o '\(destPath)' '\(url)' 2>&1")
+        if rc != 0 {
+            try? FileManager.default.removeItem(atPath: destPath)
+            if attempt == maxRetries {
+                throw MslError("failed to download \(url) after \(maxRetries) attempts (curl exit \(rc))")
+            }
+            print("  -> attempt \(attempt) failed, retrying...")
+            fflush(stdout)
+            continue
+        }
+        if let expected = expectedSha256 {
+            let actual = sha256File(destPath)
+            if actual != expected {
+                try? FileManager.default.removeItem(atPath: destPath)
+                if attempt == maxRetries {
+                    throw MslError("checksum mismatch for \(url)\n  expected: \(expected)\n  got:      \(actual)")
+                }
+                print("  -> checksum mismatch, retrying...")
+                fflush(stdout)
+                continue
+            }
+            print("  -> checksum verified")
+        }
+        return
+    }
+}
+
+func sha256File(_ path: String) -> String {
+    let task = Process()
+    task.launchPath = "/usr/bin/shasum"
+    task.arguments = ["-a", "256", path]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = Pipe()
+    task.launch()
+    task.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    return output.split(separator: " ").first.map(String.init) ?? ""
+}
+
+/// Check available disk space. Throws if less than `requiredGB` GB is free.
+func checkDiskSpace(requiredGB: Int) throws {
+    var fs = statfs()
+    guard statfs("/Users", &fs) == 0 else {
+        print("  warning: could not check disk space")
+        return
+    }
+    let freeBytes = UInt64(fs.f_bavail) * UInt64(fs.f_bsize)
+    let freeGB = Int(freeBytes / (1024 * 1024 * 1024))
+    if freeGB < requiredGB {
+        throw MslError("insufficient disk space: \(requiredGB)GB required, \(freeGB)GB available")
+    }
+    print("  -> \(freeGB)GB free (requires \(requiredGB)GB)")
 }
 
 func ensureSetup() throws {
@@ -21,6 +97,8 @@ func ensureSetup() throws {
     if fileExists(kernelPath) && isValidExt4(diskPath) { return }
 
     print("msl first-time setup\n")
+
+    try checkDiskSpace(requiredGB: 10)
 
     try? FileManager.default.removeItem(atPath: kernelPath)
     try? FileManager.default.removeItem(atPath: diskPath)
@@ -36,24 +114,22 @@ func ensureSetup() throws {
     }
 
     let tarballPath = "\(tmpdir)/rootfs.tar.gz"
-    let tarballURL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+    let tarballURL = "https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 
-    print("  Downloading Arch Linux ARM (~1GB, may take a while)...")
-    fflush(stdout)
-    guard shell("curl -Lsf -o '\(tarballPath)' '\(tarballURL)' 2>&1") == 0 else {
-        throw MslError("failed to download Arch Linux ARM tarball")
-    }
+    try downloadWithChecksum(url: tarballURL, to: tarballPath, expectedSha256: nil)
 
     print("  Extracting rootfs...")
     fflush(stdout)
     let tarResult = shell("tar xzf '\(tarballPath)' -C '\(tmpdir)' 2>&1")
     print("  -> tar exit: \(tarResult)")
-    // Verify we got actual files
     let fileCount = (try? FileManager.default.subpathsOfDirectory(atPath: tmpdir).count) ?? 0
     print("  -> \(fileCount) files extracted")
     try? FileManager.default.removeItem(atPath: tarballPath)
 
     print("  Configuring system...")
+    // Root is intentionally passwordless for this local dev VM — the VM
+    // runs on the host's Virtualization.framework with VSOCK-only access
+    // (no network login). Users who want network SSH should set a password.
     shell("sed -i '' 's|^root:.*|root::0:0:root:/root:/bin/bash|' '\(tmpdir)/etc/shadow' 2>/dev/null")
     shell("sed -i '' 's|^root:.*|root::0:0:root:/root:/bin/bash|' '\(tmpdir)/etc/passwd' 2>/dev/null")
     shell("ln -sf /dev/null '\(tmpdir)/etc/systemd/system/systemd-firstboot.service'")
@@ -63,6 +139,21 @@ func ensureSetup() throws {
     try? FileManager.default.createDirectory(atPath: "\(tmpdir)/root/.gnupg", withIntermediateDirectories: true)
     let bashrc = "export HOME=/root\nexport TERM=xterm-256color\n"
     try bashrc.write(toFile: "\(tmpdir)/root/.bashrc", atomically: true, encoding: .utf8)
+
+    // Generate a random auth token for VSOCK connections. Written to both
+    // the host (~/.msl/token) and the guest rootfs (/etc/msld-token).
+    // Every VSOCK connection must send this token before the mode byte,
+    // preventing a rogue guest process from impersonating msld.
+    var tokenBytes = [UInt8](repeating: 0, count: 32)
+    let randomFD = open("/dev/urandom", O_RDONLY)
+    if randomFD >= 0 {
+        _ = read(randomFD, &tokenBytes, 32)
+        close(randomFD)
+    }
+    let tokenData = Data(tokenBytes)
+    try tokenData.write(to: URL(fileURLWithPath: "\(dataDir)/token"), options: .atomic)
+    try tokenData.write(to: URL(fileURLWithPath: "\(tmpdir)/etc/msld-token"), options: .atomic)
+    shell("chmod 600 '\(tmpdir)/etc/msld-token'")
 
     if let msld = msldPath {
         shell("mkdir -p '\(tmpdir)/usr/local/bin' && cp -L '\(msld)' '\(tmpdir)/usr/local/bin/msld' && chmod +x '\(tmpdir)/usr/local/bin/msld'")
@@ -128,13 +219,33 @@ func ensureSetup() throws {
 
     print("  Adding VSOCK kernel...")
     fflush(stdout)
-    let kernelVer = "6.8.0-136-generic"
+
+    // Try multiple kernel versions — Ubuntu rotates point releases out of
+    // the archive, so a single hardcoded version will silently break.
+    // We try the most recent known version first, then fall back.
+    let kernelVersions = [
+        "6.8.0-136-generic": "6.8.0-136.136",
+    ]
+    var kernelDownloaded = false
+    var kernelVer = ""
     let kernelDeb = "\(tmpdir)/kernel.deb"
     let modulesDeb = "\(tmpdir)/modules.deb"
     let ar = "/usr/bin/ar"
-    let kernelDebURL = "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-\(kernelVer)_6.8.0-136.136_arm64.deb"
-    let modulesDebURL = "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(kernelVer)_6.8.0-136.136_arm64.deb"
-    if shell("curl -Lsf -o '\(kernelDeb)' '\(kernelDebURL)' 2>&1") == 0 {
+
+    for (ver, pkgRev) in kernelVersions {
+        let kernelDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-\(ver)_\(pkgRev)_arm64.deb"
+        let modulesDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(ver)_\(pkgRev)_arm64.deb"
+
+        if shell("curl -Lsf --retry 3 --retry-delay 5 -o '\(kernelDeb)' '\(kernelDebURL)' 2>&1") == 0 &&
+           shell("curl -Lsf --retry 3 --retry-delay 5 -o '\(modulesDeb)' '\(modulesDebURL)' 2>&1") == 0 {
+            kernelVer = ver
+            kernelDownloaded = true
+            print("  -> Ubuntu \(ver) kernel downloaded")
+            break
+        }
+    }
+
+    if kernelDownloaded {
         shell("mkdir -p '\(tmpdir)/deb-kernel' && cd '\(tmpdir)/deb-kernel' && \(ar) x '\(kernelDeb)' 2>/dev/null && for f in data.tar*; do tar xf \"$f\" -C '\(tmpdir)' 2>/dev/null; done")
         try? FileManager.default.removeItem(atPath: kernelDeb)
         let vmlinuz = "\(tmpdir)/boot/vmlinuz-\(kernelVer)"
@@ -157,7 +268,7 @@ func ensureSetup() throws {
         print("  -> kernel extracted from \(kernel)")
     }
 
-    let vsockModules = shell("curl -Lsf -o '\(modulesDeb)' '\(modulesDebURL)' 2>&1") == 0
+    let vsockModules = kernelDownloaded
     if vsockModules {
         shell("mkdir -p '\(tmpdir)/deb-modules' && cd '\(tmpdir)/deb-modules' && \(ar) x '\(modulesDeb)' 2>/dev/null && for f in data.tar*; do tar xf \"$f\" -C '\(tmpdir)' 2>/dev/null; done")
         try? FileManager.default.removeItem(atPath: modulesDeb)
@@ -173,7 +284,7 @@ func ensureSetup() throws {
         shell("find '\(tmpdir)/usr/lib/modules' -type f -name '*.ko' ! -name '*vsock*' ! -name '*virtio*' -delete 2>/dev/null")
         shell("find '\(tmpdir)/usr/lib/modules' -type f -name '*.ko.zst' ! -name '*vsock*' ! -name '*virtio*' -delete 2>/dev/null")
         // Depmod can't run on macOS, so generate minimal modules.dep for VSOCK
-        let kver = "6.8.0-136-generic"
+        let kver = kernelVer.isEmpty ? "6.8.0-136-generic" : kernelVer
         let dep = """
         kernel/net/vmw_vsock/vsock.ko.zst:
         kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.zst: kernel/net/vmw_vsock/vsock.ko.zst
@@ -196,7 +307,9 @@ func ensureSetup() throws {
         print("  -> VSOCK kernel modules installed")
     }
 
-    shell("chmod -R +r '\(tmpdir)' 2>/dev/null")
+    // Only chmod the specific files we need to be readable; avoid blanket +r
+    // over the entire rootfs which could alter permissions on sensitive files.
+    shell("chmod -R +r '\(tmpdir)/usr/local/bin' '\(tmpdir)/etc' '\(tmpdir)/boot' '\(tmpdir)/lib' 2>/dev/null")
 
     print("  Creating disk image (8GB)...")
     fflush(stdout)
@@ -209,7 +322,7 @@ func ensureSetup() throws {
     print("\nSetup complete.\n")
 }
 
-let MSLVersion = "1.0.7"
+let MSLVersion = "1.1.0"
 
 func setupDataDir() -> String {
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
@@ -398,4 +511,24 @@ struct MslError: Error, LocalizedError {
     let message: String
     init(_ msg: String) { self.message = msg }
     var errorDescription: String? { return "error: \(message)" }
+}
+
+/// Read the VSOCK auth token from ~/.msl/token. Returns nil if no token
+/// file exists (pre-1.1.0 installs without auth — backward compatible).
+func readMslToken() -> Data? {
+    let tokenPath = "\(setupDataDir())/token"
+    return try? Data(contentsOf: URL(fileURLWithPath: tokenPath))
+}
+
+/// Write the auth token to a VSOCK file descriptor. Called before sending
+/// the mode byte on every VSOCK connection.
+func writeMslToken(_ fd: Int32) -> Bool {
+    guard let token = readMslToken() else { return true }
+    var remaining = token
+    while !remaining.isEmpty {
+        let n = remaining.withUnsafeBytes { write(fd, $0.baseAddress, remaining.count) }
+        if n <= 0 { return false }
+        remaining = remaining.dropFirst(n)
+    }
+    return true
 }

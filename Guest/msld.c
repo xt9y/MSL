@@ -16,10 +16,38 @@
 
 #define PORT 9999
 #define BUF_SIZE 65536
+#define TOKEN_SIZE 32
+#define TOKEN_FILE "/etc/msld-token"
 
 static int       g_listen_fd  = -1;
 static int       g_client_fd  = -1;
 static char      g_display[64] = {0};
+static char      g_token[TOKEN_SIZE] = {0};
+static int       g_token_loaded = 0;
+
+static void load_token(void) {
+    if (g_token_loaded) return;
+    g_token_loaded = 1;
+    FILE *fp = fopen(TOKEN_FILE, "r");
+    if (!fp) return;
+    size_t n = fread(g_token, 1, TOKEN_SIZE, fp);
+    (void)n;
+    fclose(fp);
+}
+
+static int verify_token(int client_fd) {
+    load_token();
+    if (g_token[0] == 0) return 1; /* no token file = no auth (backward compat) */
+
+    char recv_token[TOKEN_SIZE];
+    ssize_t total = 0;
+    while (total < TOKEN_SIZE) {
+        ssize_t n = read(client_fd, recv_token + total, TOKEN_SIZE - total);
+        if (n <= 0) return 0;
+        total += n;
+    }
+    return memcmp(g_token, recv_token, TOKEN_SIZE) == 0;
+}
 
 static void probe_gateway(void) {
     if (g_display[0]) return;
@@ -55,6 +83,12 @@ static void xwrite(int fd, const void *buf, size_t len) {
 static void serve_client(int client_fd) {
     g_client_fd = client_fd;
     probe_gateway();
+
+    /* Auth: verify token before doing anything else. */
+    if (!verify_token(client_fd)) {
+        return;
+    }
+
     struct timeval tv = {5, 0};
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -92,16 +126,10 @@ static void serve_client(int client_fd) {
 
         if (pid == 0) {
             if (master_fd >= 0) close(master_fd);
-            /* Avoid leaking the vsock listener (and any other parent
-               fd) into the spawned shell. Otherwise an orphaned shell
-               keeps port 9999 bound and the next msld can't bind. */
             if (g_listen_fd > 2) close(g_listen_fd);
             if (client_fd > 2)  close(client_fd);
             setsid();
             if (g_display[0]) setenv("DISPLAY", g_display, 1);
-            /* Honor the user's login shell from /etc/passwd (so bash
-               gets argv[0]="-bash" and enables readline editing), and
-               fall back to /bin/bash then /bin/sh if lookup fails. */
             struct passwd *pw = getpwuid(getuid());
             const char *shell = (pw && pw->pw_shell && *pw->pw_shell) ? pw->pw_shell : "/bin/bash";
             if (access(shell, X_OK) != 0) shell = "/bin/sh";
@@ -110,7 +138,6 @@ static void serve_client(int client_fd) {
             char name[64];
             snprintf(name, sizeof(name), "-%s", base);
             execl(shell, name, (char *)NULL);
-            /* unlikely */
             execl("/bin/sh", "-sh", (char *)NULL);
             _exit(127);
         }
@@ -256,6 +283,8 @@ shell_done:
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
+
+    load_token();
 
     int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     g_listen_fd = fd;

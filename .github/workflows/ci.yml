@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build host binary
+        run: make
+
+      - name: Verify --version compiles and runs
+        run: ./build/msl --version
+
+      - name: Build guest daemon
+        run: |
+          brew install filosottile/musl-cross/musl-cross || true
+          aarch64-linux-musl-gcc -static -Os -s -o build/msld Guest/msld.c
+          file build/msld
