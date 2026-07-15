@@ -27,7 +27,7 @@ func ensureSetup() throws {
 
     let mke2fs = try ensureMke2fs()
     ensureXQuartz()
-    let msldPath = findMsldBinary()
+    let msldPath = ensureMsldBinary()
 
     let tmpdir = "/tmp/msl-rootfs-\(UUID().uuidString)"
     try FileManager.default.createDirectory(atPath: tmpdir, withIntermediateDirectories: true)
@@ -349,6 +349,33 @@ private func findMsldBinary() -> String? {
             return expanded
         }
     }
+    return nil
+}
+
+/// Find msld locally, or build it from Guest/msld.c if the cross_COMPILER is available.
+private func ensureMsldBinary() -> String? {
+    if let p = findMsldBinary() { return p }
+    if shell("which aarch64-linux-musl-gcc >/dev/null 2>&1") == 0 {
+        print("  Building guest daemon (msld)...")
+        fflush(stdout)
+        let selfPath = CommandLine.arguments[0]
+        let selfDir = (selfPath as NSString).deletingLastPathComponent
+        let outPath = "\(NSTemporaryDirectory())msld-\(UUID().uuidString)"
+        let srcCandidates = [
+            "\(selfDir)/../Guest/msld.c",
+            "\(selfDir)/../share/msl/Guest/msld.c",
+        ]
+        for src in srcCandidates {
+            let expanded = (src as NSString).standardizingPath
+            if shell("aarch64-linux-musl-gcc -static -Os -s -o '\(outPath)' '\(expanded)' 2>&1") == 0 {
+                print("  -> msld built")
+                return outPath
+            }
+        }
+    }
+    print("  warning: msld binary not found and aarch64-linux-musl-gcc not available")
+    print("           install with: brew tap filosottile/musl-cross && brew install musl-cross --with-aarch64")
+    print("           then run: msl --setup again")
     return nil
 }
 

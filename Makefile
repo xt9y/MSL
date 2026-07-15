@@ -16,7 +16,8 @@ OBJC_HEADER = Sources/BridgingHeader.h
 
 GUEST_SRC = Guest/msld.c
 
-all: sign $(BUILD_DIR)/msld
+all: sign
+	@command -v aarch64-linux-musl-gcc >/dev/null 2>&1 && $(MAKE) $(BUILD_DIR)/msld || echo "warning: aarch64-linux-musl-gcc not found, skipping msld"
 
 $(PRODUCT): $(SWIFT_SRCS) $(OBJC_SRCS)
 	@mkdir -p $(BUILD_DIR)
