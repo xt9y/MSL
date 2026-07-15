@@ -1,4 +1,5 @@
 import Foundation
+import Virtualization
 
 let dataDir = setupDataDir()
 var savedTermios = termios()
@@ -239,24 +240,18 @@ func main() {
         startDaemonInBackground()
 
     case "--start-daemon":
-        mslLog("daemon starting")
         let daemon = Daemon(dataDir: dataDir)
-        mslLog("Daemon init done")
         DispatchQueue.main.async {
             Task {
                 do {
-                    mslLog("daemon.run() starting")
                     try await daemon.run()
-                    mslLog("daemon.run() returned cleanly")
                 } catch {
                     mslLog("daemon error: \(error.localizedDescription)")
                 }
                 CFRunLoopStop(CFRunLoopGetMain())
             }
         }
-        mslLog("starting CFRunLoop")
         CFRunLoopRun()
-        mslLog("CFRunLoop exited")
         exit(0)
 
     case "exec":
@@ -322,6 +317,15 @@ func main() {
             print("Run 'brew uninstall msl msld' to remove the binaries.")
         } catch {
             fputs("msl: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+
+    case "check-virt":
+        if VZVirtualMachine.isSupported {
+            print("virtualization supported")
+            exit(0)
+        } else {
+            print("virtualization not supported")
             exit(1)
         }
 
