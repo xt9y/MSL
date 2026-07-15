@@ -30,7 +30,7 @@ struct DaemonState {
     }
 
     /// Atomically write the PID file using flock to prevent concurrent
-    /// --start invocations from racing past the isRunning() check.
+    /// start invocations from racing past the isRunning() check.
     func writePID() throws {
         let lockPath = pidPath + ".lock"
         let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
@@ -39,7 +39,7 @@ struct DaemonState {
         }
         if flock(fd, LOCK_EX | LOCK_NB) != 0 {
             close(fd)
-            throw MslError("another msl --start is already running (lock held)")
+            throw MslError("another msl start is already running (lock held)")
         }
         let pid = getpid()
         try "\(pid)".write(toFile: pidPath, atomically: true, encoding: .utf8)
