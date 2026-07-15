@@ -5,9 +5,19 @@ let mslLogPath = "/tmp/msl-daemon.log"
 func mslLog(_ message: String) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(timestamp)] \(message)\n"
+    guard let data = line.data(using: .utf8) else { return }
     if let fh = FileHandle(forWritingAtPath: mslLogPath) {
+        // Keep log under ~1 MB — truncate to the last 512 KB if it grows too large.
+        let maxSize: UInt64 = 1024 * 1024
+        let keepSize: UInt64 = 512 * 1024
+        let size = (try? FileManager.default.attributesOfItem(atPath: mslLogPath)[.size] as? UInt64) ?? 0
+        if size + UInt64(data.count) > maxSize {
+            fh.seekToEndOfFile()
+            let offset = size > keepSize ? size - keepSize : 0
+            fh.truncateFile(atOffset: offset)
+        }
         fh.seekToEndOfFile()
-        if let data = line.data(using: .utf8) { fh.write(data) }
+        fh.write(data)
         fh.closeFile()
     }
 }
@@ -137,10 +147,15 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
     let tarballURL = "https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
     let sha256URL = "\(tarballURL).sha256"
 
-    // Try to fetch the published sha256 checksum; if we get it, verify against it.
+    // Try to fetch the published sha256 checksum from the same origin.
+    // This guards against corruption/delivery errors but not against a
+    // compromised origin — a truly pinned hash would need manual updates.
     let expectedSha = (try? Data(contentsOf: URL(string: sha256URL)!))
         .flatMap { String(data: $0, encoding: .utf8) }
         .flatMap { $0.split(separator: " ").first.map(String.init) }
+    if expectedSha == nil {
+        fputs("  warning: could not fetch sha256 checksum — skipping integrity check\n", stderr)
+    }
 
     try downloadWithChecksum(url: tarballURL, to: tarballPath, expectedSha256: expectedSha)
 
@@ -254,9 +269,11 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
     // the archive, so a single hardcoded version will silently break.
     // We try the most recent known version first, then fall back.
     let kernelVersions: [(String, String)] = [
+        ("6.8.0-145-generic", "6.8.0-145.149"),
         ("6.8.0-141-generic", "6.8.0-141.144"),
         ("6.8.0-139-generic", "6.8.0-139.142"),
         ("6.8.0-136-generic", "6.8.0-136.136"),
+        ("6.8.0-101-generic", "6.8.0-101.104"),
     ]
     var kernelDownloaded = false
     var kernelVer = ""
@@ -268,12 +285,17 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
         let kernelDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-\(ver)_\(pkgRev)_arm64.deb"
         let modulesDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(ver)_\(pkgRev)_arm64.deb"
 
-        if shell("curl -Lsf --retry 3 --retry-delay 5 -o '\(kernelDeb)' '\(kernelDebURL)' 2>&1") == 0 &&
-           shell("curl -Lsf --retry 3 --retry-delay 5 -o '\(modulesDeb)' '\(modulesDebURL)' 2>&1") == 0 {
+        do {
+            try downloadWithChecksum(url: kernelDebURL, to: kernelDeb, expectedSha256: nil)
+            try downloadWithChecksum(url: modulesDebURL, to: modulesDeb, expectedSha256: nil)
             kernelVer = ver
             kernelDownloaded = true
             print("  Kernel \(ver) downloaded.")
             break
+        } catch {
+            try? FileManager.default.removeItem(atPath: kernelDeb)
+            try? FileManager.default.removeItem(atPath: modulesDeb)
+            continue
         }
     }
 
@@ -281,7 +303,10 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
         shell("mkdir -p '\(tmpdir)/deb-kernel' && cd '\(tmpdir)/deb-kernel' && \(ar) x '\(kernelDeb)' 2>/dev/null && for f in data.tar*; do tar xf \"$f\" -C '\(tmpdir)' 2>/dev/null; done")
         try? FileManager.default.removeItem(atPath: kernelDeb)
         let vmlinuz = "\(tmpdir)/boot/vmlinuz-\(kernelVer)"
-        _ = shell("gunzip -c '\(vmlinuz)' > '\(kernelPath)' 2>/dev/null && echo KERNEL_OK || echo KERNEL_FAIL")
+        _ = shell("gunzip -c '\(vmlinuz)' > '\(kernelPath)' 2>/dev/null")
+        guard fileExists(kernelPath) else {
+            throw MslError("kernel extraction failed — \(kernelPath) is missing or empty")
+        }
         print("  Kernel \(kernelVer) extracted.")
     } else {
         fputs("  warning: VSOCK kernel unavailable, using Arch ARM fallback\n", stderr)

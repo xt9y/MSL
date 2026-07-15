@@ -51,13 +51,7 @@ struct DaemonState {
     }
 
     private func processIsMsl(_ pid: pid_t) -> Bool {
-        let commPath = "/proc/\(pid)/comm"
-        if FileManager.default.fileExists(atPath: commPath) {
-            if let data = try? String(contentsOfFile: commPath, encoding: .utf8) {
-                return data.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("msl")
-            }
-        }
         let result = shellOutput("ps -p \(pid) -o comm= 2>/dev/null")
-        return result.contains("msl") && !result.contains("grep")
+        return result.contains("msl")
     }
 }
