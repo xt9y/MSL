@@ -4,6 +4,11 @@ BUILD_DIR = build
 PRODUCT = $(BUILD_DIR)/msl
 VERSION_FILE = Sources/Version.swift
 
+# Code signing identity. Defaults to ad-hoc. Set to a Developer ID to
+# produce a Gatekeeper-friendly binary:
+#   make DEV_ID="Developer ID Application: Your Name (TEAMID)"
+DEV_ID ?= -
+
 # VERSION is auto-generated from the latest git tag.
 # Falls back to 0.0.0-dev if no tags exist (e.g. fresh clone in CI).
 VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0-dev")
@@ -40,9 +45,19 @@ $(PRODUCT): gen-version $(filter-out Sources/Version.swift,$(SWIFT_SRCS)) $(OBJC
 sign: $(PRODUCT)
 	codesign --entitlements Resources/msl.entitlements \
 		--force \
-		--sign - \
+		--sign "$(DEV_ID)" \
 		$(PRODUCT)
-	@echo "Signed: $(PRODUCT)"
+	@echo "Signed: $(PRODUCT) (identity: $(DEV_ID))"
+
+# Notarize the signed binary. Requires DEV_ID to be a valid Developer ID,
+# and KEYCHAIN_PROFILE to be a notarytool keychain profile name.
+#   make notarize DEV_ID="Developer ID Application: ..." KEYCHAIN_PROFILE=notary
+notarize: sign
+	xcrun notarytool submit "$(PRODUCT)" \
+		--keychain-profile "$(KEYCHAIN_PROFILE)" \
+		--wait 2>&1
+	xcrun stapler staple "$(PRODUCT)"
+	@echo "Notarized: $(PRODUCT)"
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -66,10 +81,10 @@ clean:
 # No manual version bumping needed — version is derived from git tags.
 #
 # Notes:
-# - Code signing uses ad-hoc identity (--sign -) because msl doesn't have
-#   a paid Apple Developer ID. Users may see a Gatekeeper warning on first
-#   run. To fix permanently: obtain a Developer ID, replace --sign - with
-#   --sign "Developer ID Application: ...", and notarize the binary.
+# - Code signing uses ad-hoc ($(DEV_ID)) by default. To produce a
+#   Gatekeeper-friendly binary, set DEV_ID:
+#     make DEV_ID="Developer ID Application: Your Name (TEAMID)"
+#   Then run `make notarize` to submit to Apple for notarization.
 # ─────────────────────────────────────────────────────────────────────
 release: build-check
 	@echo "Releasing v$(VERSION_NEXT) ..."; \
@@ -102,7 +117,7 @@ build-check:
 		-import-objc-header $(OBJC_HEADER) \
 		-o $(PRODUCT) \
 		$(SWIFT_SRCS) $(OBJC_SRCS) || { echo "ERROR: build failed"; exit 1; }
-	@codesign --entitlements Resources/msl.entitlements --force --sign - $(PRODUCT) 2>/dev/null
+	@codesign --entitlements Resources/msl.entitlements --force --sign "$(DEV_ID)" $(PRODUCT) 2>/dev/null
 	@./$(PRODUCT) version | head -1 | grep -q "msl" && echo "Binary OK (v$(VERSION_NEXT))" || { echo "ERROR: binary test failed"; exit 1; }
 
 .PHONY: all sign clean release build-check gen-version

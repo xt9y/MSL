@@ -70,6 +70,7 @@ class Daemon {
         }
 
         mslLog("VM ready")
+        try? "1".write(toFile: "\(dataDir)/daemon.ready", atomically: true, encoding: .utf8)
         await ensurePacmanKeyring()
 
         try ipc.start { [weak self] requestData, send in
@@ -106,7 +107,7 @@ class Daemon {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathSize = MemoryLayout.size(ofValue: addr.sun_path)
-        withUnsafeMutablePointer(to: &addr.sun_path.0) { strncpy($0, shellPath, pathSize - 1) }
+        _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { strncpy($0, shellPath, pathSize - 1) }
         let addrSize = MemoryLayout.size(ofValue: addr)
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(addrSize)) }
@@ -147,7 +148,9 @@ class Daemon {
                                 if n <= 0 { break }
                                 var pos = 0
                                 while pos < n {
-                                    let w = write(vsockFD, UnsafeRawPointer(buf) + pos, n - pos)
+                                    let w = buf.withUnsafeBytes { raw in
+                                        write(vsockFD, raw.baseAddress! + pos, n - pos)
+                                    }
                                     if w <= 0 { break }
                                     pos += w
                                 }
@@ -161,7 +164,9 @@ class Daemon {
                                 if n <= 0 { break }
                                 var pos = 0
                                 while pos < n {
-                                    let w = write(cliFD, UnsafeRawPointer(buf) + pos, n - pos)
+                                    let w = buf.withUnsafeBytes { raw in
+                                        write(cliFD, raw.baseAddress! + pos, n - pos)
+                                    }
                                     if w <= 0 { break }
                                     pos += w
                                 }

@@ -1,6 +1,18 @@
 import Foundation
 @preconcurrency import Virtualization
 
+// MARK: - Unchecked sendable wrappers for Virtualization framework types
+
+private struct UncheckedVM: @unchecked Sendable {
+    let value: VZVirtualMachine
+    init(_ vm: VZVirtualMachine) { self.value = vm }
+}
+
+private struct UncheckedHandle: @unchecked Sendable {
+    let value: UnsafeMutableRawPointer
+    init(_ h: UnsafeMutableRawPointer) { self.value = h }
+}
+
 class MSLVM: NSObject {
     let dataDir: String
     let kernelPath: String
@@ -100,12 +112,13 @@ class MSLVM: NSObject {
 
     func start() async throws {
         guard let vm = vm else { throw MslError("VM not configured") }
+        let uncheckedVM = UncheckedVM(vm)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     DispatchQueue.main.async {
-                        vm.start { result in
+                        uncheckedVM.value.start { result in
                             switch result {
                             case .success:
                                 cont.resume()
@@ -178,7 +191,7 @@ class MSLVM: NSObject {
         if result.1 < 0 { return (Data(), 255) }
         let handle = result.0
         let fd = result.1
-        defer { DispatchQueue.main.async { self.closeVsock(handle: handle) } }
+        defer { self.closeVsock(handle: handle) }
 
         if !writeMslToken(fd) { return (Data(), 255) }
 
@@ -218,6 +231,10 @@ class MSLVM: NSObject {
         return (outputData, exitCode)
     }
 }
+
+// MARK: - Sendable conformance for ObjC bridge types
+
+extension MSLVSOCK: @unchecked Sendable {}
 
 extension MSLVM: VZVirtualMachineDelegate {
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) {

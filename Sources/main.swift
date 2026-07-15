@@ -80,14 +80,16 @@ func runShell() {
             if n > 0 {
                 var written = 0
                 while written < n {
-                    let w = write(sock, UnsafeRawPointer(buf) + written, n - written)
+                    let w = buf.withUnsafeBytes { raw in
+                        write(sock, raw.baseAddress! + written, n - written)
+                    }
                     if w <= 0 { running = false; break }
                     written += w
                 }
             } else if n == 0 {
                 shutdown(sock, SHUT_WR)
                 var pfd2 = pollfd(fd: sock, events: Int16(POLLIN), revents: 0)
-                while withUnsafeMutablePointer(to: &pfd2) { poll($0, 1, 1000) } > 0 {
+                while withUnsafeMutablePointer(to: &pfd2, { poll($0, 1, 1000) }) > 0 {
                     let n2 = read(sock, &buf, buf.count)
                     if n2 <= 0 { break }
                     _ = write(STDOUT_FILENO, buf, n2)
@@ -109,6 +111,7 @@ func printHelp() {
     print("  shell              Open an interactive shell")
     print("  exec <command>     Run a command in the VM")
     print("  setup              Download and prepare the VM disk image")
+    print("  upgrade            Re-download kernel and rootfs (wipe + re-setup)")
     print("  uninstall          Remove all msl data")
     print("  version            Show version")
     print("  help               Show this help")
@@ -170,11 +173,26 @@ func startDaemonInBackground() {
         if let pid = state.readPID(), pid == childPID { break }
         usleep(100_000)
     }
-    if let pid = state.readPID(), pid == childPID {
-        print("msl \(MSLVersion) started (pid \(childPID))")
-    } else {
+    guard let pid = state.readPID(), pid == childPID else {
         fputs("msl: daemon failed to start — check /tmp/msl-daemon.log\n", stderr)
         exit(1)
+    }
+
+    // Wait for VM to be actually reachable (up to 120s for first boot)
+    let readyPath = "\(dataDir)/daemon.ready"
+    var vmReady = false
+    for _ in 0..<1200 {
+        if FileManager.default.fileExists(atPath: readyPath) {
+            try? FileManager.default.removeItem(atPath: readyPath)
+            vmReady = true
+            break
+        }
+        usleep(100_000)
+    }
+    if vmReady {
+        print("msl \(MSLVersion) started (pid \(pid))")
+    } else {
+        fputs("msl: VM booting in background (pid \(pid)) — use 'msl shell' to connect\n", stderr)
     }
 }
 
@@ -193,6 +211,17 @@ func main() {
 
     case "version":
         print("msl \(MSLVersion)")
+
+    case "upgrade":
+        let (ds, rs, cc) = parseSetupFlags(args)
+        do {
+            try? FileManager.default.removeItem(atPath: "\(dataDir)/kernel")
+            try? FileManager.default.removeItem(atPath: "\(dataDir)/arch.img")
+            try ensureSetup(diskSizeGB: ds, ramSizeGB: rs, cpuCores: cc)
+        } catch {
+            fputs("msl: upgrade failed: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
 
     case "setup":
         let (ds, rs, cc) = parseSetupFlags(args)
