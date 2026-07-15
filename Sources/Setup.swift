@@ -86,7 +86,31 @@ func checkDiskSpace(requiredGB: Int) throws {
     print("  -> \(freeGB)GB free (requires \(requiredGB)GB)")
 }
 
-func ensureSetup() throws {
+struct VMConfig: Codable {
+    var diskSizeGB: Int = 8
+    var ramSizeGB: Int = 2
+    var cpuCores: Int = 2
+
+    static let `default` = VMConfig()
+
+    static func load(from dataDir: String) -> VMConfig {
+        let path = "\(dataDir)/config.json"
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let config = try? JSONDecoder().decode(VMConfig.self, from: data) {
+            return config
+        }
+        return .default
+    }
+
+    func save(to dataDir: String) {
+        let path = "\(dataDir)/config.json"
+        if let data = try? JSONEncoder().encode(self) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+    }
+}
+
+func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) throws {
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
     let dataDir = "\(home)/.msl"
     let kernelPath = "\(dataDir)/kernel"
@@ -98,7 +122,7 @@ func ensureSetup() throws {
 
     print("msl first-time setup\n")
 
-    try checkDiskSpace(requiredGB: 10)
+    try checkDiskSpace(requiredGB: diskSizeGB + 2)
 
     try? FileManager.default.removeItem(atPath: kernelPath)
     try? FileManager.default.removeItem(atPath: diskPath)
@@ -311,18 +335,19 @@ func ensureSetup() throws {
     // over the entire rootfs which could alter permissions on sensitive files.
     shell("chmod -R +r '\(tmpdir)/usr/local/bin' '\(tmpdir)/etc' '\(tmpdir)/boot' '\(tmpdir)/lib' 2>/dev/null")
 
-    print("  Creating disk image (8GB)...")
+    print("  Creating disk image (\(diskSizeGB)GB)...")
     fflush(stdout)
-    let cmd = "'\(mke2fs)' -t ext4 -d '\(tmpdir)' '\(diskPath)' 8G 2>&1"
+    let cmd = "'\(mke2fs)' -t ext4 -d '\(tmpdir)' '\(diskPath)' \(diskSizeGB)G 2>&1"
     guard shell(cmd) == 0 else {
         throw MslError("failed to create disk image")
     }
     print("  -> \(diskPath)")
 
+    let config = VMConfig(diskSizeGB: diskSizeGB, ramSizeGB: ramSizeGB, cpuCores: cpuCores)
+    config.save(to: dataDir)
+
     print("\nSetup complete.\n")
 }
-
-let MSLVersion = "1.1.0"
 
 func setupDataDir() -> String {
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"

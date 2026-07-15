@@ -58,12 +58,9 @@ class MSLVM: NSObject {
         platform.machineIdentifier = loadOrCreateMachineIdentifier()
         config.platform = platform
         config.bootLoader = bootLoader
-        // Configurable CPU/memory via env vars MSL_CPU and MSL_MEMORY_MB.
-        // Defaults: 2 vCPU, 2048MB — reasonable for most dev workloads.
-        let cpuCount = Int(ProcessInfo.processInfo.environment["MSL_CPU"] ?? "") ?? 2
-        let memoryMB = Int(ProcessInfo.processInfo.environment["MSL_MEMORY_MB"] ?? "") ?? 2048
-        config.cpuCount = cpuCount
-        config.memorySize = UInt64(memoryMB) * 1024 * 1024
+        let vmConfig = VMConfig.load(from: dataDir)
+        config.cpuCount = vmConfig.cpuCores
+        config.memorySize = UInt64(vmConfig.ramSizeGB) * 1024 * 1024 * 1024
         config.storageDevices = [storage]
 
         print("  - entropy..."); fflush(stdout)
