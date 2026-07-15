@@ -20,9 +20,9 @@
 #define TOKEN_FILE "/etc/msld-token"
 #define MAX_FORKS 64
 
-static int       g_listen_fd  = -1;
-static int       g_client_fd  = -1;
-static volatile int g_child_count = 0;
+static int                g_listen_fd  = -1;
+static int                g_client_fd  = -1;
+static volatile sig_atomic_t g_child_count = 0;
 static char      g_display[64] = {0};
 static unsigned char g_token[TOKEN_SIZE] = {0};
 static int       g_token_bytes = 0;  /* 0 = not loaded, >0 = loaded with that many bytes */
@@ -322,6 +322,10 @@ int main(void) {
         close(fd); return 1;
     }
 
+    sigset_t sigchld_set, sigchld_old;
+    sigemptyset(&sigchld_set);
+    sigaddset(&sigchld_set, SIGCHLD);
+
     while (1) {
         int client_fd = accept(fd, NULL, NULL);
         if (client_fd < 0) {
@@ -329,13 +333,18 @@ int main(void) {
             break;
         }
 
-        if (g_child_count >= MAX_FORKS) {
+        /* Block SIGCHLD so the handler can't fire between load and store. */
+        sigprocmask(SIG_BLOCK, &sigchld_set, &sigchld_old);
+        int cur = g_child_count;
+        if (cur >= MAX_FORKS) {
+            sigprocmask(SIG_SETMASK, &sigchld_old, NULL);
             close(client_fd);
             continue;
         }
 
         pid_t pid = fork();
         if (pid < 0) {
+            sigprocmask(SIG_SETMASK, &sigchld_old, NULL);
             close(client_fd);
             continue;
         }
@@ -346,8 +355,9 @@ int main(void) {
             close(client_fd);
             _exit(0);
         }
-        /* Parent — track child, close our copy */
-        g_child_count++;
+        /* Parent — track child while SIGCHLD is still blocked */
+        g_child_count = cur + 1;
+        sigprocmask(SIG_SETMASK, &sigchld_old, NULL);
         close(client_fd);
     }
 

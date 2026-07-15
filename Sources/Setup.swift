@@ -267,14 +267,41 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
 
     // Try multiple kernel versions — Ubuntu rotates point releases out of
     // the archive, so a single hardcoded version will silently break.
-    // We try the most recent known version first, then fall back.
-    let kernelVersions: [(String, String)] = [
-        ("6.8.0-145-generic", "6.8.0-145.149"),
-        ("6.8.0-141-generic", "6.8.0-141.144"),
-        ("6.8.0-139-generic", "6.8.0-139.142"),
-        ("6.8.0-136-generic", "6.8.0-136.136"),
-        ("6.8.0-101-generic", "6.8.0-101.104"),
-    ]
+    // We first attempt to discover versions from the Ubuntu package index
+    // (auto-discovery), then fall back to a hardcoded list.
+    func sha256ForDeb(url: String) -> String? {
+        // Try per-file checksum first
+        if let data = try? Data(contentsOf: URL(string: "\(url).sha256")!),
+           let str = String(data: data, encoding: .utf8) {
+            return str.split(separator: " ").first.map(String.init)
+        }
+        // Fall back: fetch SHA256SUMS from parent directory
+        let base = url.dropLast(url.split(separator: "/").last?.count ?? 0)
+        if let data = try? Data(contentsOf: URL(string: "\(base)SHA256SUMS")!),
+           let str = String(data: data, encoding: .utf8) {
+            let filename = url.split(separator: "/").last.map(String.init) ?? ""
+            for line in str.split(separator: "\n") {
+                if line.hasSuffix("  \(filename)") || line.hasSuffix(" *\(filename)") {
+                    return line.split(separator: " ").first.map(String.init)
+                }
+            }
+        }
+        return nil
+    }
+
+    let kernelVersions: [(String, String)]
+    let discovered = discoverKernelVersions()
+    if !discovered.isEmpty {
+        kernelVersions = discovered
+    } else {
+        kernelVersions = [
+            ("6.8.0-145-generic", "6.8.0-145.149"),
+            ("6.8.0-141-generic", "6.8.0-141.144"),
+            ("6.8.0-139-generic", "6.8.0-139.142"),
+            ("6.8.0-136-generic", "6.8.0-136.136"),
+            ("6.8.0-101-generic", "6.8.0-101.104"),
+        ]
+    }
     var kernelDownloaded = false
     var kernelVer = ""
     let kernelDeb = "\(tmpdir)/kernel.deb"
@@ -286,8 +313,10 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
         let modulesDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(ver)_\(pkgRev)_arm64.deb"
 
         do {
-            try downloadWithChecksum(url: kernelDebURL, to: kernelDeb, expectedSha256: nil)
-            try downloadWithChecksum(url: modulesDebURL, to: modulesDeb, expectedSha256: nil)
+            let kernelSha = sha256ForDeb(url: kernelDebURL)
+            let modulesSha = sha256ForDeb(url: modulesDebURL)
+            try downloadWithChecksum(url: kernelDebURL, to: kernelDeb, expectedSha256: kernelSha)
+            try downloadWithChecksum(url: modulesDebURL, to: modulesDeb, expectedSha256: modulesSha)
             kernelVer = ver
             kernelDownloaded = true
             print("  Kernel \(ver) downloaded.")
@@ -506,15 +535,11 @@ private func ensureXQuartz() {
 
 /// Resolve the real directory containing the msl binary, following symlinks and PATH.
 private func resolveSelfDir() -> String {
-    var selfPath = CommandLine.arguments[0]
-    if !selfPath.hasPrefix("/") {
-        let which = shellOutput("which \(selfPath) 2>/dev/null")
-        if !which.isEmpty { selfPath = which }
-    }
+    let selfPath = resolveBinaryPath()
     var st = stat()
     if lstat(selfPath, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK {
-        if let resolved = try? Foundation.URL(resolvingAliasFileAt: URL(fileURLWithPath: selfPath)) {
-            selfPath = resolved.path
+        if let resolved = try? URL(resolvingAliasFileAt: URL(fileURLWithPath: selfPath)) {
+            return (resolved.path as NSString).deletingLastPathComponent
         }
     }
     return (selfPath as NSString).deletingLastPathComponent
@@ -563,6 +588,31 @@ private func ensureMsldBinary() -> String? {
     print("  error: msld not found — install with: brew install msld")
     print("           then run: msl setup again")
     return nil
+}
+
+/// Auto-discover available kernel versions from Ubuntu Ports index.
+/// Falls back to empty array (uses hardcoded list) on any error.
+func discoverKernelVersions() -> [(String, String)] {
+    let url = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/"
+    guard let data = try? Data(contentsOf: URL(string: url)!),
+          let html = String(data: data, encoding: .utf8)
+    else { return [] }
+
+    var versions: [(String, String)] = []
+    let pattern = #"linux-image-unsigned-([\w.+-]+)_([\w.+-]+)_arm64\.deb"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    let nsRange = NSRange(html.startIndex..<html.endIndex, in: html)
+    regex.enumerateMatches(in: html, range: nsRange) { match, _, _ in
+        guard let match = match, match.numberOfRanges == 3 else { return }
+        let verRange = Range(match.range(at: 1), in: html)!
+        let revRange = Range(match.range(at: 2), in: html)!
+        let ver = String(html[verRange])
+        let rev = String(html[revRange])
+        versions.append((ver, rev))
+    }
+    // Sort by version descending (newest first) to try latest first
+    versions.sort { $0.0 > $1.0 }
+    return versions
 }
 
 struct MslError: Error, LocalizedError {
