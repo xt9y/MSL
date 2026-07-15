@@ -363,12 +363,18 @@ func shellOutput(_ command: String) -> String {
 }
 
 private func findMsldBinary() -> String? {
+    // Primary: msld in PATH (installed via homebrew formula)
+    let which = shellOutput("which msld 2>/dev/null")
+    if !which.isEmpty {
+        var st = stat()
+        if stat(which, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG {
+            return which
+        }
+    }
+    // Fallbacks for development builds
     let selfDir = resolveSelfDir()
     let candidates = [
         "\(selfDir)/msld",
-        "\(selfDir)/../Guest/msld",
-        "\(selfDir)/../share/msl/msld",
-        "\(FileManager.default.currentDirectoryPath)/Guest/msld",
         "\(FileManager.default.currentDirectoryPath)/build/msld",
     ]
     for c in candidates {
@@ -381,45 +387,9 @@ private func findMsldBinary() -> String? {
     return nil
 }
 
-/// Find msld locally, build it from source, or download a pre-built binary.
 private func ensureMsldBinary() -> String? {
     if let p = findMsldBinary() { return p }
-
-    // Try building from source if the cross-compiler is available
-    if shell("which aarch64-linux-musl-gcc >/dev/null 2>&1") == 0 {
-        print("  Building guest daemon (msld)...")
-        fflush(stdout)
-        let selfDir = resolveSelfDir()
-        let outPath = "\(NSTemporaryDirectory())msld-\(UUID().uuidString)"
-        let srcCandidates = [
-            "\(selfDir)/../Guest/msld.c",
-            "\(selfDir)/../share/msl/msld.c",
-        ]
-        for src in srcCandidates {
-            let expanded = (src as NSString).standardizingPath
-            if shell("aarch64-linux-musl-gcc -static -Os -s -o '\(outPath)' '\(expanded)' 2>&1") == 0 {
-                print("  -> msld built")
-                return outPath
-            }
-        }
-    }
-
-    // Download pre-built msld from GitHub releases
-    print("  Downloading guest daemon (msld)...")
-    fflush(stdout)
-    let outPath = "\(NSTemporaryDirectory())msld-\(UUID().uuidString)"
-    let url = "https://github.com/xt9y/msl/releases/download/v\(MSLVersion)/msld"
-    let rc = shell("curl -Lsf -o '\(outPath)' '\(url)' 2>&1")
-    if rc == 0 {
-        var st = stat()
-        if stat(outPath, &st) == 0, st.st_size > 1000 {
-            print("  -> msld downloaded")
-            return outPath
-        }
-    }
-
-    print("  warning: could not obtain msld (build or download failed)")
-    print("           to build from source: brew tap filosottile/musl-cross && brew install musl-cross --with-aarch64")
+    print("  error: msld not found — install with: brew install msld")
     print("           then run: msl --setup again")
     return nil
 }
