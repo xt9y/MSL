@@ -4,11 +4,8 @@ BUILD_DIR = build
 PRODUCT = $(BUILD_DIR)/msl
 VERSION_FILE = Sources/Version.swift
 
-VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0-dev")
-
 SWIFT_SRCS = \
 	Sources/main.swift \
-	Sources/Version.swift \
 	Sources/Daemon.swift \
 	Sources/VM.swift \
 	Sources/IPC.swift \
@@ -20,17 +17,18 @@ OBJC_HEADER = Sources/BridgingHeader.h
 
 all: $(PRODUCT)
 
-gen-version:
+$(VERSION_FILE):
 	@echo 'import Foundation' > $(VERSION_FILE)
-	@echo 'let MSLVersion = "$(VERSION)"' >> $(VERSION_FILE)
+	@GIT_VERSION=$$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0-dev"); \
+	 echo "let MSLVersion = \"$$GIT_VERSION\"" >> $(VERSION_FILE)
 
-$(PRODUCT): gen-version $(SWIFT_SRCS) $(OBJC_SRCS)
+$(PRODUCT): $(VERSION_FILE) $(SWIFT_SRCS) $(OBJC_SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(SWIFTC) $(SWIFT_FLAGS) \
 		-import-objc-header $(OBJC_HEADER) \
 		-o $@ \
-		$(SWIFT_SRCS) $(OBJC_SRCS)
-	@echo "Build complete: $(PRODUCT) (v$(VERSION))"
+		$(VERSION_FILE) $(SWIFT_SRCS) $(OBJC_SRCS)
+	@echo "Build complete: $(PRODUCT) (v$$(grep MSLVersion $(VERSION_FILE) | sed 's/.*"\(.*\)"/\1/'))"
 
 clean:
 	rm -rf $(BUILD_DIR)
