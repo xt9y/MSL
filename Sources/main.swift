@@ -25,7 +25,7 @@ func runShell() {
     let rc = withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(sock, $0, socklen_t(addrSize)) }
     }
-    guard rc == 0 else { fputs("msl: not running — start with 'msl --start'\n", stderr); exit(1) }
+    guard rc == 0 else { fputs("msl: not running — start with 'msl start'\n", stderr); exit(1) }
 
     var ok: UInt8 = 0
     var okReceived = false
@@ -105,9 +105,9 @@ func printHelp() {
     print("  help               Show this help")
     print()
     print("Setup options:")
-    print("  --disk-size N / -ds N    Disk image size in GB (default: 8)")
-    print("  --ram-size  N / -rs N    RAM size in GB (default: 2)")
-    print("  --cpu-cores N / -cc N    Number of vCPUs (default: 2)")
+    print("  --disk-size N    Disk image size in GB (default: 8)")
+    print("  --ram-size  N    RAM size in GB (default: 2)")
+    print("  --cpu-cores N    Number of vCPUs (default: 2)")
 }
 
 func parseSetupFlags(_ args: [String]) -> (Int, Int, Int) {
@@ -115,11 +115,11 @@ func parseSetupFlags(_ args: [String]) -> (Int, Int, Int) {
     var i = 2
     while i < args.count {
         switch args[i] {
-        case "--disk-size", "-ds":
+        case "--disk-size":
             if i + 1 < args.count, let v = Int(args[i + 1]) { diskSize = v; i += 1 }
-        case "--ram-size", "-rs":
+        case "--ram-size":
             if i + 1 < args.count, let v = Int(args[i + 1]) { ramSize = v; i += 1 }
-        case "--cpu-cores", "-cc":
+        case "--cpu-cores":
             if i + 1 < args.count, let v = Int(args[i + 1]) { cpuCores = v; i += 1 }
         default:
             break
@@ -129,8 +129,19 @@ func parseSetupFlags(_ args: [String]) -> (Int, Int, Int) {
     return (diskSize, ramSize, cpuCores)
 }
 
-func startDaemonInBackground() {
+func resolveBinaryPath() -> String {
     let exe = CommandLine.arguments[0]
+    if exe.hasPrefix("/") { return exe }
+    let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
+    for dir in pathEnv.split(separator: ":").map(String.init) {
+        let full = "\(dir)/\(exe)"
+        if access(full, X_OK) == 0 { return full }
+    }
+    return exe
+}
+
+func startDaemonInBackground() {
+    let exe = resolveBinaryPath()
     let task = Process()
     task.launchPath = exe
     task.arguments = ["--start-daemon"]
@@ -155,15 +166,11 @@ func main() {
         exit(0)
     }
 
-    // Allow -- prefix for compat, but prefer bare commands
-    var cmd = args[1]
-    if cmd.hasPrefix("--") { cmd = String(cmd.dropFirst(2)) }
-
-    switch cmd {
-    case "help", "-h":
+    switch args[1] {
+    case "help":
         printHelp()
 
-    case "version", "-v":
+    case "version":
         print("msl \(MSLVersion)")
 
     case "setup":

@@ -526,7 +526,7 @@ private func findMsldBinary() -> String? {
 private func ensureMsldBinary() -> String? {
     if let p = findMsldBinary() { return p }
     print("  error: msld not found — install with: brew install msld")
-    print("           then run: msl --setup again")
+    print("           then run: msl setup again")
     return nil
 }
 
