@@ -59,6 +59,9 @@ func ensureSetup() throws {
     shell("ln -sf /dev/null '\(tmpdir)/etc/systemd/system/systemd-firstboot.service'")
     shell("ln -sf ../usr/share/zoneinfo/UTC '\(tmpdir)/etc/localtime'")
     try? FileManager.default.removeItem(atPath: "\(tmpdir)/etc/machine-id")
+    try? FileManager.default.createDirectory(atPath: "\(tmpdir)/root", withIntermediateDirectories: true)
+    let bashrc = "export HOME=/root\nexport DISPLAY=:1\n"
+    try bashrc.write(toFile: "\(tmpdir)/root/.bashrc", atomically: true, encoding: .utf8)
 
     if let msld = msldPath {
         try FileManager.default.copyItem(atPath: msld, toPath: "\(tmpdir)/usr/local/bin/msld")

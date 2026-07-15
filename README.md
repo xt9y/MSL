@@ -45,17 +45,6 @@ msl --exec "pacman -S --noconfirm xorg-xeyes"
 msl --exec xeyes
 ```
 
-**OpenGL note:** XQuartz does not support GLX over TCP connections. Simple X11 apps work, but OpenGL apps require a local X server with software rendering inside the VM:
-
-```bash
-msl --exec "pacman -S --noconfirm xorg-server mesa llvm"
-msl --exec "Xorg :1 &  sleep 1 && DISPLAY=:1 glxinfo | head -5"
-msl --shell
-# inside the shell:
-# export DISPLAY=:1
-# ./your_opengl_app
-```
-
 ## Build from source
 
 ```bash
