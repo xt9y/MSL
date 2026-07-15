@@ -18,12 +18,21 @@
 #define BUF_SIZE 65536
 #define TOKEN_SIZE 32
 #define TOKEN_FILE "/etc/msld-token"
+#define MAX_FORKS 64
 
 static int       g_listen_fd  = -1;
 static int       g_client_fd  = -1;
+static volatile int g_child_count = 0;
 static char      g_display[64] = {0};
 static unsigned char g_token[TOKEN_SIZE] = {0};
 static int       g_token_bytes = 0;  /* 0 = not loaded, >0 = loaded with that many bytes */
+
+static void handle_sigchld(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        if (g_child_count > 0) g_child_count--;
+    }
+}
 
 static void load_token(void) {
     if (g_token_bytes > 0) return;
@@ -289,7 +298,7 @@ shell_done:
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_DFL);
+    signal(SIGCHLD, handle_sigchld);
 
     load_token();
 
@@ -314,13 +323,15 @@ int main(void) {
     }
 
     while (1) {
-        // Reap any zombie children
-        while (waitpid(-1, NULL, WNOHANG) > 0);
-
         int client_fd = accept(fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        if (g_child_count >= MAX_FORKS) {
+            close(client_fd);
+            continue;
         }
 
         pid_t pid = fork();
@@ -335,7 +346,8 @@ int main(void) {
             close(client_fd);
             _exit(0);
         }
-        /* Parent — close the child's copy and go back to accepting */
+        /* Parent — track child, close our copy */
+        g_child_count++;
         close(client_fd);
     }
 
