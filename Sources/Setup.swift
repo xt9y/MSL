@@ -6,8 +6,10 @@ func mslLog(_ message: String) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(timestamp)] \(message)\n"
     guard let data = line.data(using: .utf8) else { return }
+    if !FileManager.default.fileExists(atPath: mslLogPath) {
+        FileManager.default.createFile(atPath: mslLogPath, contents: nil)
+    }
     if let fh = FileHandle(forWritingAtPath: mslLogPath) {
-        // Keep log under ~1 MB — truncate to the last 512 KB if it grows too large.
         let maxSize: UInt64 = 1024 * 1024
         let keepSize: UInt64 = 512 * 1024
         let size = (try? FileManager.default.attributesOfItem(atPath: mslLogPath)[.size] as? UInt64) ?? 0
