@@ -56,15 +56,13 @@ class Daemon {
         mslLog("booting VM")
         try vm.boot()
 
-        do {
-            try await vm.start()
+        do { try await vm.start()
         } catch {
             mslLog("vm.start failed: \(error.localizedDescription)")
             throw error
         }
 
-        do {
-            try await waitForGuest(timeout: 120)
+        do { try await waitForGuest(timeout: 120)
         } catch {
             mslLog("waitForGuest failed: \(error.localizedDescription)")
             throw error
@@ -105,11 +103,8 @@ class Daemon {
         mslLog("initializing pacman keyring")
         let setup = "rm -f /var/lib/pacman/db.lck && chown -R root:root /root/.gnupg 2>/dev/null; chmod 700 /root/.gnupg 2>/dev/null; pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy --noconfirm archlinuxarm-keyring ncurses iptables-nft; pacman -Syy && systemctl enable --now msl-firewall && touch \(guestMarker)"
         let (out, code) = await vm.execOnGuest(setup, timeout: 180)
-        if code == 0 {
-            try? "".write(toFile: hostMarker, atomically: true, encoding: .utf8)
-        } else {
-            mslLog("pacman-key init failed (exit \(code)): \(String(data: out, encoding: .utf8) ?? "")")
-        }
+        if code == 0 { try? "".write(toFile: hostMarker, atomically: true, encoding: .utf8) }
+        else { mslLog("pacman-key init failed (exit \(code)): \(String(data: out, encoding: .utf8) ?? "")") }
     }
 
     private func startShellListener() {
@@ -182,11 +177,8 @@ class Daemon {
                                         pos += w
                                     }
                                     if pos < n { break }
-                                } else if n == 0 {
-                                    break
-                                } else if nErrno != EAGAIN && nErrno != EWOULDBLOCK {
-                                    break
-                                }
+                                } else if n == 0 { break
+                                } else if nErrno != EAGAIN && nErrno != EWOULDBLOCK { break }
                             }
 
                             if pfds[1].revents & Int16(POLLIN) != 0 {
@@ -204,11 +196,8 @@ class Daemon {
                                         pos += w
                                     }
                                     if pos < vn { break }
-                                } else if vn == 0 {
-                                    break
-                                } else if vnErrno != EAGAIN && vnErrno != EWOULDBLOCK {
-                                    break
-                                }
+                                } else if vn == 0 {  break
+                                } else if vnErrno != EAGAIN && vnErrno != EWOULDBLOCK { break }
                             }
                         }
                         DispatchQueue.main.async { [self] in
@@ -335,13 +324,11 @@ class Daemon {
                                 allOutput.append(outBuf, count: min(n, room))
                                 if allOutput.count >= maxOutputBytes { break commandLoop }
                             }
-                        } else if n == 0 {
-                            break
+                        } else if n == 0 { break
                         } else if savedErrno == EAGAIN || savedErrno == EWOULDBLOCK {
                             usleep(10000)
                             continue
-                        } else {
-                            break
+                        } else { break
                         }
                     }
 
@@ -364,9 +351,7 @@ class Daemon {
                         outputData = allOutput.withUnsafeBytes { ptr in
                             Data(bytes: ptr.baseAddress!, count: exitOffset)
                         }
-                    } else {
-                        outputData = Data()
-                    }
+                    } else { outputData = Data() }
                     let exitCode = allOutput.withUnsafeBytes { ptr in
                         ptr.loadUnaligned(fromByteOffset: exitOffset, as: UInt32.self).bigEndian
                     }
