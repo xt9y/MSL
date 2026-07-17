@@ -90,18 +90,13 @@ class MSLVM: NSObject {
         )
         config.serialPorts = [serialPort]
 
-        do {
-            try config.validate()
-        } catch {
-            throw MslError("config invalid: \(error.localizedDescription)")
-        }
+        do { try config.validate() }
+        catch { throw MslError("config invalid: \(error.localizedDescription)") }
 
         vm = VZVirtualMachine(configuration: config, queue: .main)
         vm?.delegate = self
 
-        if let v = vm {
-            vsock?.setVM(v)
-        }
+        if let v = vm { vsock?.setVM(v) }
     }
 
     func start() async throws {
@@ -114,10 +109,8 @@ class MSLVM: NSObject {
                     DispatchQueue.main.async {
                         uncheckedVM.value.start { result in
                             switch result {
-                            case .success:
-                                cont.resume()
-                            case .failure(let err):
-                                cont.resume(throwing: err)
+                            case .success: cont.resume()
+                            case .failure(let err): cont.resume(throwing: err)
                             }
                         }
                     }

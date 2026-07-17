@@ -127,11 +127,8 @@ func downloadWithChecksum(urls: [String], to destPath: String, expectedSha256: S
             print("  Trying mirror \(mirrorIndex + 1)/\(urls.count): \(url)")
         }
         for attempt in 1...3 {
-            if attempt == 1 {
-                print("  Downloading \(url)...")
-            } else {
-                print("  Retrying (\(attempt)/3)...")
-            }
+            if attempt == 1 { print("  Downloading \(url)...") }
+            else { print("  Retrying (\(attempt)/3)...") }
             fflush(stdout)
             var curlArgs = ["-Lsf", "--retry", "3", "--retry-delay", "5", "--connect-timeout", "30", "--max-time", "300"]
             if attempt > 1 { curlArgs += ["-C", "-"] }
@@ -168,11 +165,7 @@ func sha256File(_ path: String) -> String {
     let pipe = Pipe()
     task.standardOutput = pipe
     task.standardError = Pipe()
-    do {
-        try task.run()
-    } catch {
-        return ""
-    }
+    do { try task.run() } catch { return "" }
     task.waitUntilExit()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let output = String(data: data, encoding: .utf8) ?? ""

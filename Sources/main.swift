@@ -141,7 +141,6 @@ func printHelp() {
     print("  setup              Download and prepare the VM disk image")
     print("  update             Re-download rootfs and rebuild disk image")
     print("  uninstall          Remove all msl data")
-    print("  check-virt         Check if virtualization is supported")
     print("  version            Show version")
     print("  help               Show this help")
     print()
@@ -156,14 +155,10 @@ func parseSetupFlags(_ args: [String]) -> (Int, Int, Int) {
     var i = 2
     while i < args.count {
         switch args[i] {
-        case "--disk-size":
-            if i + 1 < args.count, let v = Int(args[i + 1]) { diskSize = v; i += 1 }
-        case "--ram-size":
-            if i + 1 < args.count, let v = Int(args[i + 1]) { ramSize = v; i += 1 }
-        case "--cpu-cores":
-            if i + 1 < args.count, let v = Int(args[i + 1]) { cpuCores = v; i += 1 }
-        default:
-            break
+        case "--disk-size":  if i + 1 < args.count, let v = Int(args[i + 1]) { diskSize = v; i += 1 }
+        case "--ram-size":   if i + 1 < args.count, let v = Int(args[i + 1]) { ramSize = v; i += 1 }
+        case "--cpu-cores":  if i + 1 < args.count, let v = Int(args[i + 1]) { cpuCores = v; i += 1 }
+        default:             break
         }
         i += 1
     }
@@ -218,11 +213,8 @@ func startDaemonInBackground() {
         }
         usleep(100_000)
     }
-    if vmReady {
-        print("msl \(MSLVersion) started (pid \(pid))")
-    } else {
-        fputs("msl: VM booting in background (pid \(pid)) — use 'msl shell' to connect\n", stderr)
-    }
+    if vmReady { print("msl \(MSLVersion) started (pid \(pid))") }
+    else { fputs("msl: VM booting in background (pid \(pid)) — use 'msl shell' to connect\n", stderr) }
 }
 
 func main() {
