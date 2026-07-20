@@ -169,6 +169,7 @@ func printHelp() {
     print("  setup              Download and prepare the VM disk image")
     print("  update             Re-download rootfs and rebuild disk image")
     print("  fix                Re-sign binary (restore virtualization entitlement)")
+    print("  upgrade            Update msl and msld via Homebrew")
     print("  uninstall          Remove all msl data")
     print("  version            Show version")
     print("  help               Show this help")
@@ -456,6 +457,22 @@ func main() {
             fputs("msl: virtualization entitlement still missing — try 'brew reinstall msl'\n", stderr)
             exit(1)
         }
+
+    case "upgrade":
+        let brew = Process()
+        brew.launchPath = "/bin/bash"
+        brew.arguments = ["-c", "brew update && brew upgrade msl msld"]
+        brew.standardOutput = FileHandle.standardOutput
+        brew.standardError = FileHandle.standardError
+        brew.standardInput = FileHandle.standardInput
+        do {
+            try brew.run()
+            brew.waitUntilExit()
+        } catch {
+            fputs("msl: upgrade failed: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+        exit(brew.terminationStatus)
 
     case "check-virt":
         if VZVirtualMachine.isSupported {
