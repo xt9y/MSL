@@ -7,7 +7,7 @@ Run Arch Linux ARM on macOS using Apple's [Virtualization.framework](https://dev
 
 ```bash
 brew tap xt9y/MSL
-brew install msl
+brew install msl msld
 ```
 
 
