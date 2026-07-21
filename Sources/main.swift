@@ -86,9 +86,9 @@ func runShell() {
         raw.c_cflag |= tcflag_t(CS8)
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw)
         needTerminalRestore = true
-        signal(SIGTERM) { _ in restoreTerminal(); exit(130) }
-        signal(SIGINT) { _ in restoreTerminal(); exit(130) }
-        signal(SIGHUP) { _ in restoreTerminal(); exit(129) }
+        signal(SIGTERM) { _ in restoreTerminal(); _exit(130) }
+        signal(SIGINT) { _ in restoreTerminal(); _exit(130) }
+        signal(SIGHUP) { _ in restoreTerminal(); _exit(129) }
 
         shellWinsizeNeedsUpdate = false
         signal(SIGWINCH, SIG_IGN)
@@ -209,7 +209,7 @@ func resolveBinaryPath() -> String {
 func startDaemonInBackground() {
     let exe = resolveBinaryPath()
     let task = Process()
-    task.launchPath = exe
+    task.executableURL = URL(fileURLWithPath: exe)
     task.arguments = ["--start-daemon"]
     task.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
     task.standardError = FileHandle(forWritingAtPath: "/dev/null")
@@ -247,6 +247,21 @@ func startDaemonInBackground() {
     else { fputs("msl: VM booting in background (pid \(pid)) — use 'msl shell' to connect\n", stderr) }
 }
 
+func parseVersion(_ s: String) -> [Int] {
+    return s.split(separator: ".").compactMap { Int($0) }
+}
+
+func compareVersions(_ a: [Int], _ b: [Int]) -> ComparisonResult {
+    let count = max(a.count, b.count)
+    for i in 0..<count {
+        let va = i < a.count ? a[i] : 0
+        let vb = i < b.count ? b[i] : 0
+        if va < vb { return .orderedAscending }
+        if va > vb { return .orderedDescending }
+    }
+    return .orderedSame
+}
+
 func checkForUpdate() {
     let cachePath = "\(dataDir)/.version-cache"
     let cacheTTL: TimeInterval = 3600
@@ -262,27 +277,40 @@ func checkForUpdate() {
     }
 
     if latestTag == nil,
-       let url = URL(string: "https://api.github.com/repos/xt9y/msl/tags"),
-       let data = try? Data(contentsOf: url),
-       let tags = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-        let verTags = tags.compactMap { ($0["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { $0.hasPrefix("v") }
-        let latest = verTags.max { a, b in
-            let pa = a.dropFirst().split(separator: ".").compactMap { Int($0) }
-            let pb = b.dropFirst().split(separator: ".").compactMap { Int($0) }
-            guard pa.count == 3, pb.count == 3 else { return false }
-            return pa[0] < pb[0] || (pa[0] == pb[0] && pa[1] < pb[1]) || (pa[0] == pb[0] && pa[1] == pb[1] && pa[2] < pb[2])
+       let url = URL(string: "https://api.github.com/repos/xt9y/msl/tags") {
+        let semaphore = DispatchSemaphore(value: 0)
+        var apiData: Data?
+        var apiError: Error?
+        let task = URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 2)) { data, _, error in
+            apiData = data
+            apiError = error
+            semaphore.signal()
         }
-        if let tag = latest {
-            latestTag = tag
-            try? "\(now)\n\(tag)".write(toFile: cachePath, atomically: true, encoding: .utf8)
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 3)
+        if let data = apiData,
+           let tags = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            let verTags = tags.compactMap { ($0["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { $0.hasPrefix("v") }
+            let latest = verTags.max { a, b in
+                let pa = parseVersion(String(a.dropFirst()))
+                let pb = parseVersion(String(b.dropFirst()))
+                return compareVersions(pa, pb) == .orderedAscending
+            }
+            if let tag = latest {
+                latestTag = tag
+                try? "\(now)\n\(tag)".write(toFile: cachePath, atomically: true, encoding: .utf8)
+            }
+        }
+        if let err = apiError {
+            mslLog("update check failed: \(err.localizedDescription)")
         }
     }
 
     guard let tag = latestTag, tag.hasPrefix("v") else { return }
-    let curParts = MSLVersion.split(separator: ".").compactMap { Int($0) }
-    let parts = String(tag.dropFirst()).split(separator: ".").compactMap { Int($0) }
-    guard parts.count == 3, curParts.count == 3 else { return }
-    if parts[0] > curParts[0] || (parts[0] == curParts[0] && parts[1] > curParts[1]) || (parts[0] == curParts[0] && parts[1] == curParts[1] && parts[2] > curParts[2]) {
+    let curParts = parseVersion(MSLVersion)
+    let tagParts = parseVersion(String(tag.dropFirst()))
+    guard !curParts.isEmpty, !tagParts.isEmpty else { return }
+    if compareVersions(tagParts, curParts) == .orderedDescending {
         fputs("msl: new version \(tag) available — update with 'brew upgrade msl msld'\n", stderr)
     }
 }
@@ -360,6 +388,11 @@ func main() {
             fputs("Usage: msl exec <command>\n", stderr)
             exit(1)
         }
+        // Note: args are re-joined with spaces, then passed to guest /bin/sh -c.
+        // The user's shell already parsed quoting, and the guest shell re-parses the
+        // rejoined string. This means globs, $VARS, and embedded quotes may behave
+        // unintuitively. For complex commands, wrap everything in single quotes:
+        //   msl exec 'echo $HOME && ls -la'
         let command = args[2...].joined(separator: " ")
         let client = IPCClient(path: "\(dataDir)/msld.sock")
         do {
@@ -435,7 +468,7 @@ func main() {
         let tmp = "/tmp/msl-entitlements.plist"
         try? plist.write(toFile: tmp, atomically: true, encoding: .utf8)
         let cs = Process()
-        cs.launchPath = "/usr/bin/codesign"
+        cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
         cs.arguments = ["--entitlements", tmp, "--force", "--sign", "-", exe]
         cs.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
         cs.standardError = FileHandle(forWritingAtPath: "/dev/null")
@@ -460,7 +493,7 @@ func main() {
 
     case "upgrade":
         let brew = Process()
-        brew.launchPath = "/bin/bash"
+        brew.executableURL = URL(fileURLWithPath: "/bin/bash")
         brew.arguments = ["-c", "brew update && brew upgrade msl msld"]
         brew.standardOutput = FileHandle.standardOutput
         brew.standardError = FileHandle.standardError

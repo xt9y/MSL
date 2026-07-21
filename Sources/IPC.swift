@@ -18,6 +18,8 @@ class IPCServer {
     let path: String
     private var sock: Int32 = -1
     private var source: DispatchSourceRead?
+    private var clientSources: [Int32: DispatchSourceRead] = [:]
+    private var clientLock = NSLock()
 
     init(path: String) {
         self.path = path
@@ -26,14 +28,18 @@ class IPCServer {
     func start(handler: @escaping (Data, @escaping (Data) -> Void) -> Void) throws {
         unlink(path)
 
+        var addr = sockaddr_un()
+        let sunPathMaxLen = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8.count < sunPathMaxLen else {
+            throw MslError("socket path too long: \(path)")
+        }
+
         sock = socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else { throw MslError("socket: \(String(cString: strerror(errno)))") }
 
-        var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathSize = MemoryLayout.size(ofValue: addr.sun_path)
         _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            strncpy(ptr, path, pathSize - 1)
+            strncpy(ptr, path, sunPathMaxLen - 1)
         }
 
         let addrSize = MemoryLayout.size(ofValue: addr)
@@ -55,19 +61,32 @@ class IPCServer {
 
     func stop() {
         source?.cancel()
+        source = nil
+        clientLock.lock()
+        for (_, cs) in clientSources { cs.cancel() }
+        clientSources.removeAll()
+        clientLock.unlock()
         if sock >= 0 { close(sock); sock = -1 }
         unlink(path)
     }
 
     private func handleAccept(handler: @escaping (Data, @escaping (Data) -> Void) -> Void) {
         let client = Darwin.accept(sock, nil, nil)
-        guard client >= 0 else { return }
+        guard client >= 0 else {
+            if errno != EINTR { mslLog("IPC accept failed: \(String(cString: strerror(errno)))") }
+            return
+        }
 
         let clientSource = DispatchSource.makeReadSource(fileDescriptor: client, queue: .main)
+
+        clientLock.lock()
+        clientSources[client] = clientSource
+        clientLock.unlock()
+
         let send: (Data) -> Void = { data in
             var remaining = data
             while !remaining.isEmpty {
-                let n = write(client, (remaining as NSData).bytes, remaining.count)
+                let n = remaining.withUnsafeBytes { write(client, $0.baseAddress, remaining.count) }
                 if n <= 0 { break }
                 remaining = remaining.dropFirst(n)
             }
@@ -76,20 +95,20 @@ class IPCServer {
         var readBuf = [UInt8](repeating: 0, count: 65536)
         var accum = Data()
 
-        clientSource.setEventHandler {
+        clientSource.setEventHandler { [weak self] in
             let n = read(client, &readBuf, readBuf.count)
             if n <= 0 {
-                clientSource.cancel()
+                self?.removeClient(client)
                 close(client)
                 return
             }
             accum.append(readBuf, count: n)
 
-    // Process complete frames (cap at 100MB to prevent OOM on malformed length)
             while accum.count >= 4 {
                 let len = UInt32(bigEndian: accum.withUnsafeBytes { $0.load(as: UInt32.self) })
-                guard len <= 100 * 1024 * 1024 else {
-                    clientSource.cancel()
+                guard len > 0, len <= 10 * 1024 * 1024 else {
+                    mslLog("IPC client sent invalid length \(len) — disconnecting")
+                    self?.removeClient(client)
                     close(client)
                     return
                 }
@@ -99,11 +118,16 @@ class IPCServer {
                 let payload = accum.subdata(in: 4..<total)
                 accum = accum.dropFirst(total)
 
-                // Re-arm the source after each request (simple serial handling)
                 handler(payload, send)
             }
         }
         clientSource.resume()
+    }
+
+    private func removeClient(_ fd: Int32) {
+        clientLock.lock()
+        if let cs = clientSources.removeValue(forKey: fd) { cs.cancel() }
+        clientLock.unlock()
     }
 }
 
@@ -121,6 +145,12 @@ class IPCClient {
         guard sock >= 0 else { throw MslError("socket: \(String(cString: strerror(errno)))") }
         defer { close(sock) }
 
+        var addr = sockaddr_un()
+        let sunPathMaxLen = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8.count < sunPathMaxLen else {
+            throw MslError("socket path too long: \(path)")
+        }
+
         // Set send + receive timeouts on the socket so we don't hang forever
         var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
         let tvSize = socklen_t(MemoryLayout.size(ofValue: tv))
@@ -131,11 +161,9 @@ class IPCClient {
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, $0, tvSize)
         }
 
-        var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathSize = MemoryLayout.size(ofValue: addr.sun_path)
         _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            strncpy(ptr, path, pathSize - 1)
+            strncpy(ptr, path, sunPathMaxLen - 1)
         }
 
         let addrSize = MemoryLayout.size(ofValue: addr)
@@ -165,6 +193,7 @@ class IPCClient {
         var buf = [UInt8](repeating: 0, count: 131072)
         var accum = Data()
         let deadline = Date().addingTimeInterval(timeout)
+        var gotDone = false
 
         while Date() < deadline {
             let n = read(sock, &buf, buf.count)
@@ -174,7 +203,7 @@ class IPCClient {
                 break
             } else {
                 if errno == EAGAIN || errno == EWOULDBLOCK {
-                    if messages.isEmpty {
+                    if messages.isEmpty || !gotDone {
                         throw MslError("read timed out after \(Int(timeout))s")
                     }
                     break
@@ -191,6 +220,9 @@ class IPCClient {
                 let msgLen = accum.withUnsafeBytes { ptr in
                     ptr.loadUnaligned(fromByteOffset: 4, as: UInt32.self).bigEndian
                 }
+                guard msgLen <= 100 * 1024 * 1024 else {
+                    throw MslError("response frame too large (\(msgLen) bytes)")
+                }
                 let total = Int(8 + msgLen)
                 guard accum.count >= total else { break }
                 var msgData = Data(count: total - 8)
@@ -201,7 +233,8 @@ class IPCClient {
                 }
                 accum.removeFirst(total)
                 messages.append(IPCMessage(type: type, data: msgData))
-                if type == .done || type == .exitCode { return messages }
+                if type == .done { gotDone = true; return messages }
+                if type == .exitCode { gotDone = true }
             }
         }
 

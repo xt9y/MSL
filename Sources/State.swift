@@ -32,6 +32,10 @@ struct DaemonState {
     /// Acquire an exclusive flock on the PID file and hold it for our
     /// entire lifetime.  This prevents a second daemon from starting
     /// while we are alive, even if our PID file is briefly absent.
+    ///
+    /// Writes the PID directly to the already-open fd (via write + ftruncate),
+    /// never through an atomic write that would replace the inode and defeat
+    /// the flock.
     mutating func writePID() throws {
         let fd = open(pidPath, O_CREAT | O_RDWR, 0o644)
         guard fd >= 0 else {
@@ -42,7 +46,18 @@ struct DaemonState {
             throw MslError("another msl start is already running (lock held)")
         }
         let pid = getpid()
-        try "\(pid)".write(toFile: pidPath, atomically: true, encoding: .utf8)
+        let pidStr = "\(pid)\n"
+        _ = ftruncate(fd, 0)
+        lseek(fd, 0, SEEK_SET)
+        let pidData = pidStr.data(using: .utf8)!
+        var written = 0
+        while written < pidData.count {
+            let n = pidData.withUnsafeBytes { ptr in
+                write(fd, ptr.baseAddress! + written, pidData.count - written)
+            }
+            if n <= 0 { close(fd); throw MslError("failed to write PID: \(String(cString: strerror(errno)))") }
+            written += n
+        }
         lockFD = fd
     }
 
@@ -62,6 +77,7 @@ struct DaemonState {
             return false
         }
         let path = String(cString: buf)
-        return path.hasSuffix("/msl")
+        guard path.hasSuffix("/msl") else { return false }
+        return true
     }
 }

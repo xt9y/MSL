@@ -1,6 +1,6 @@
 import Foundation
 
-let mslLogPath = "/tmp/msl-daemon.log"
+let mslLogPath = "\(NSTemporaryDirectory())msl-daemon.log"
 let mslLogQueue = DispatchQueue(label: "msl.log")
 let mslLogFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
@@ -20,8 +20,15 @@ func mslLog(_ message: String) {
         let maxSize: UInt64 = 1024 * 1024
         fh.seekToEndOfFile()
         if fh.offsetInFile + UInt64(data.count) > maxSize {
-            fh.truncateFile(atOffset: 0)
-            fh.seekToEndOfFile()
+            fh.closeFile()
+            try? FileManager.default.removeItem(atPath: mslLogPath + ".1")
+            try? FileManager.default.moveItem(atPath: mslLogPath, toPath: mslLogPath + ".1")
+            FileManager.default.createFile(atPath: mslLogPath, contents: nil)
+            guard let newFH = FileHandle(forWritingAtPath: mslLogPath) else { return }
+            newFH.seekToEndOfFile()
+            newFH.write(data)
+            newFH.closeFile()
+            return
         }
         fh.write(data)
     }
@@ -92,9 +99,12 @@ let archLinuxArmSigningKey = "68B3537F39A313B3E574D06777193F152BDBE6A6"
 /// Throws if gpg is available but verification fails.
 func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws -> Bool {
     guard proc("/usr/bin/gpg", ["--version"]) == 0 else { return false }
+    guard let sigURL = URL(string: sigURL) else {
+        throw MslError("invalid signature URL: \(sigURL)")
+    }
     let sigData: Data
     do {
-        sigData = try Data(contentsOf: URL(string: sigURL)!)
+        sigData = try Data(contentsOf: sigURL)
     } catch {
         return false
     }
@@ -125,10 +135,55 @@ func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws 
     do {
         try gpgVerify.run()
         gpgVerify.waitUntilExit()
-        return gpgVerify.terminationStatus == 0
+        if gpgVerify.terminationStatus != 0 {
+            let errData = (gpgVerify.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile() ?? Data()
+            let errMsg = String(data: errData, encoding: .utf8) ?? "unknown error"
+            throw MslError("GPG signature verification failed for \(file): \(errMsg)")
+        }
+        return true
+    } catch let e as MslError {
+        throw e
     } catch {
-        return false
+        throw MslError("GPG verification process failed: \(error.localizedDescription)")
     }
+}
+
+/// Verify a kernel .deb against Ubuntu's signed SHA256SUMS.
+func verifyDebWithGPG(debPath: String, debURL: String) throws {
+    let baseURL = debURL.dropLast(debURL.split(separator: "/").last?.count ?? 0)
+    let shaURL = "\(baseURL)SHA256SUMS"
+    let sigURL = "\(baseURL)SHA256SUMS.gpg"
+    let filename = debURL.split(separator: "/").last.map(String.init) ?? ""
+
+    // Fetch SHA256SUMS and signature
+    guard let shaData = try? Data(contentsOf: URL(string: String(shaURL))!),
+          let shaStr = String(data: shaData, encoding: .utf8) else {
+        mslLog("warning: could not fetch SHA256SUMS for kernel verification — skipping GPG check")
+        return
+    }
+
+    // Find the line for our file
+    var expectedSha: String?
+    for line in shaStr.split(separator: "\n") {
+        if line.hasSuffix("  \(filename)") || line.hasSuffix(" *\(filename)") {
+            expectedSha = line.split(separator: " ").first.map(String.init)
+            break
+        }
+    }
+    guard let expected = expectedSha else {
+        throw MslError("kernel SHA256SUMS has no entry for \(filename)")
+    }
+
+    // Verify the checksum first
+    let actual = sha256File(debPath)
+    guard actual == expected else {
+        throw MslError("kernel deb SHA256 mismatch for \(filename)")
+    }
+
+    // Verify the SHA256SUMS signature with Ubuntu's signing key
+    // Ubuntu's archive signing key fingerprint
+    let ubuntuKey = "871920D1991BC93C"
+    _ = try verifyWithGPG(file: String(shaURL), sigURL: String(sigURL), keyFingerprint: ubuntuKey)
 }
 
 /// Download a URL to a file with retry, resume, and sha256 verification.
@@ -204,17 +259,23 @@ struct VMConfig: Codable {
 
     static func load(from dataDir: String) -> VMConfig {
         let path = "\(dataDir)/config.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let config = try? JSONDecoder().decode(VMConfig.self, from: data) {
-            return config
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+            do {
+                return try JSONDecoder().decode(VMConfig.self, from: data)
+            } catch {
+                mslLog("warning: config.json is corrupt — using defaults: \(error.localizedDescription)")
+            }
         }
         return .default
     }
 
     func save(to dataDir: String) {
         let path = "\(dataDir)/config.json"
-        if let data = try? JSONEncoder().encode(self) {
-            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(self)
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        } catch {
+            mslLog("warning: failed to save config: \(error.localizedDescription)")
         }
     }
 }
@@ -232,6 +293,7 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
     print("msl setup\n")
 
     try checkDiskSpace(requiredGB: diskSizeGB + 2, at: dataDir)
+    try checkDiskSpace(requiredGB: diskSizeGB + 2, at: NSTemporaryDirectory())
 
     try? FileManager.default.removeItem(atPath: kernelPath)
     try? FileManager.default.removeItem(atPath: diskPath)
@@ -256,20 +318,38 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
     let sha256URL = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.sha256"
 
     var expectedSha: String? = nil
-    if ProcessInfo.processInfo.environment["MSL_NO_VERIFY"] == nil,
-       let shaData = try? Data(contentsOf: URL(string: sha256URL)!),
-       let shaStr = String(data: shaData, encoding: .utf8) {
-        expectedSha = shaStr.split(separator: " ").first.map(String.init)
-        if expectedSha == nil {
-            throw MslError("failed to parse sha256 checksum from \(sha256URL)")
+    if ProcessInfo.processInfo.environment["MSL_NO_VERIFY"] == nil {
+        guard let shaURL = URL(string: sha256URL) else {
+            throw MslError("invalid sha256 URL: \(sha256URL)")
+        }
+        do {
+            let shaData = try Data(contentsOf: shaURL)
+            guard let shaStr = String(data: shaData, encoding: .utf8) else {
+                throw MslError("sha256 response not valid UTF-8")
+            }
+            expectedSha = shaStr.split(separator: " ").first.map(String.init)
+            if expectedSha == nil {
+                throw MslError("failed to parse sha256 checksum from \(sha256URL)")
+            }
+        } catch {
+            print("  warning: could not fetch sha256 checksum — proceeding without verification")
+            print("           (\(error.localizedDescription))")
+            // Note: sha256 is fetched from archlinuxarm.org, same origin as one
+            // of the tarball mirrors. Same-origin compromise defeats both checks.
+            // GPG verification (below) provides independent trust.
         }
     }
 
     try downloadWithChecksum(urls: mirrors, to: tarballPath, expectedSha256: expectedSha)
 
     let sigURL = "\(sha256URL).sig"
-    if try verifyWithGPG(file: tarballPath, sigURL: sigURL, keyFingerprint: archLinuxArmSigningKey) {
-        print("  GPG signature verified.")
+    do {
+        if try verifyWithGPG(file: tarballPath, sigURL: sigURL, keyFingerprint: archLinuxArmSigningKey) {
+            print("  GPG signature verified.")
+        }
+    } catch {
+        print("  error: GPG verification failed: \(error.localizedDescription)")
+        throw error
     }
 
     print("  Extracting rootfs...")
@@ -282,10 +362,9 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2) thr
     try? FileManager.default.removeItem(atPath: tarballPath)
 
     print("  Configuring system...")
+    print("  WARNING: root account has no password. Do not enable SSH")
+    print("           without setting a password inside the VM first.")
     fflush(stdout)
-    // Root is passwordless for convenience in this local dev VM. The VM
-    // has outbound NAT networking but no inbound port forwarding from the
-    // host. If you install sshd, set a root password first.
     try procOrThrow("/usr/bin/sed", ["-i", "", "s|^root:.*|root::0:0:root:/root:/bin/bash|", "\(tmpdir)/etc/shadow"])
     try procOrThrow("/usr/bin/sed", ["-i", "", "s|^root:.*|root::0:0:root:/root:/bin/bash|", "\(tmpdir)/etc/passwd"])
     shell("ln -sf /dev/null '\(tmpdir)/etc/systemd/system/systemd-firstboot.service'")
@@ -319,6 +398,7 @@ ExecStop=/usr/bin/iptables -F INPUT
 WantedBy=multi-user.target
 """
     try fwService.write(toFile: "\(tmpdir)/etc/systemd/system/msl-firewall.service", atomically: true, encoding: .utf8)
+    shell("mkdir -p '\(tmpdir)/etc/systemd/system/multi-user.target.wants' && ln -sf /etc/systemd/system/msl-firewall.service '\(tmpdir)/etc/systemd/system/multi-user.target.wants/msl-firewall.service'")
 
     // Generate a random auth token for VSOCK connections. Written to both
     // the host (~/.msl/token) and the guest rootfs (/etc/msld-token).
@@ -345,20 +425,44 @@ WantedBy=multi-user.target
         fputs("  warning: msld not found — run 'brew install msld' first\n", stderr)
     }
 
-    // Script to load VSOCK modules before starting msld
+    // Script to load VSOCK modules before starting msld.
+    // Tries modprobe first (uses modules.dep for the running kernel).
+    // Falls back to insmod with both .ko.zst (Ubuntu) and .ko (Arch) formats.
     let loadModulesScript = """
     #!/bin/sh
-    # Load VSOCK kernel modules for msld
+    # Log startup to kernel ring buffer for diagnostics
+    echo "msld-wrapper: starting, uname=$(uname -r)" > /dev/kmsg 2>/dev/null
+
+    # Try modprobe first (uses modules.dep)
     modprobe vsock 2>/dev/null && modprobe vmw_vsock_virtio_transport 2>/dev/null
-    # If modprobe fails (no modules.dep), try insmod directly
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "msld-wrapper: modprobe success" > /dev/kmsg 2>/dev/null
+    else
+        echo "msld-wrapper: modprobe failed, trying insmod" > /dev/kmsg 2>/dev/null
+    fi
+
+    # Fallback: try insmod with both .ko.zst (Ubuntu) and .ko (Arch) formats
     if ! lsmod 2>/dev/null | grep -q vsock; then
+        echo "msld-wrapper: vsock not loaded, attempting insmod" > /dev/kmsg 2>/dev/null
         for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-            for d in /lib/modules/*/kernel/net/vmw_vsock; do
-                f="$d/$m.ko.zst"
-                [ -f "$f" ] && insmod "$f" 2>/dev/null && break
+            for d in /lib/modules/*/kernel/net/vmw_vsock /usr/lib/modules/*/kernel/net/vmw_vsock; do
+                for ext in .ko.zst .ko; do
+                    f="$d/$m$ext"
+                    if [ -f "$f" ]; then
+                        echo "msld-wrapper: insmod $f" > /dev/kmsg 2>/dev/null
+                        insmod "$f" 2>/dev/null
+                        if [ $? -eq 0 ]; then
+                            echo "msld-wrapper: insmod $m success" > /dev/kmsg 2>/dev/null
+                            break 2
+                        fi
+                    fi
+                done
             done
         done
     fi
+
+    echo "msld-wrapper: starting msld" > /dev/kmsg 2>/dev/null
     exec /usr/local/bin/msld "$@"
     """
     let loadScriptPath = "\(tmpdir)/usr/local/bin/msld-wrapper.sh"
@@ -391,7 +495,7 @@ WantedBy=multi-user.target
 
     [Service]
     Type=oneshot
-    ExecStart=/bin/sh -c 'rm -f /var/lib/pacman/db.lck && chown -R root:root /root/.gnupg 2>/dev/null; chmod 700 /root/.gnupg 2>/dev/null; pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy --noconfirm archlinuxarm-keyring ncurses iptables-nft; pacman -Syy && systemctl enable --now msl-firewall && touch /var/lib/msl-pacman-key.done'
+    ExecStart=/bin/sh -c 'rm -f /var/lib/pacman/db.lck && chown -R root:root /root/.gnupg 2>/dev/null && chmod 700 /root/.gnupg 2>/dev/null && pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy --noconfirm archlinuxarm-keyring ncurses iptables-nft && pacman -Syy && systemctl enable --now msl-firewall && touch /var/lib/msl-pacman-key.done'
     RemainAfterExit=yes
 
     [Install]
@@ -427,8 +531,9 @@ WantedBy=multi-user.target
     // PE32+ EFI format, which is incompatible with VZLinuxBootLoader.
     let discovered = discoverKernelVersions().filter { ver, _ in
         let parts = parseKernelVersion(ver)
-        // Only accept 6.8.x kernels (gzip raw format, known to work)
-        return parts.count >= 2 && parts[0] == 6 && parts[1] == 8
+        // Accept kernels 6.8 through 6.12 (gzip raw format, known to work;
+        // newer kernels use PE32+ EFI format incompatible with VZLinuxBootLoader)
+        return parts.count >= 2 && parts[0] == 6 && parts[1] >= 8 && parts[1] <= 12
     }
     let kernelVersions: [(String, String)]
     if !discovered.isEmpty {
@@ -455,6 +560,14 @@ WantedBy=multi-user.target
             let modulesSha = sha256ForDeb(url: modulesDebURL)
             try downloadWithChecksum(urls: [kernelDebURL], to: kernelDeb, expectedSha256: kernelSha)
             try downloadWithChecksum(urls: [modulesDebURL], to: modulesDeb, expectedSha256: modulesSha)
+            // GPG-verify the kernel deb against Ubuntu's signed checksums
+            do {
+                try verifyDebWithGPG(debPath: kernelDeb, debURL: kernelDebURL)
+                mslLog("kernel GPG signature verified")
+            } catch {
+                mslLog("kernel GPG verification failed: \(error.localizedDescription)")
+                // Non-fatal: SHA256 already matched; GPG is defense-in-depth
+            }
             kernelVer = ver
             kernelDownloaded = true
             print("  Kernel \(ver) downloaded.")
@@ -472,7 +585,11 @@ WantedBy=multi-user.target
     let debKernelDir = "\(tmpdir)/deb-kernel"
     try procOrThrow("/bin/mkdir", ["-p", debKernelDir])
     try procOrThrow(ar, ["x", kernelDeb], cwd: debKernelDir)
-    let dataTars = (try? FileManager.default.contentsOfDirectory(atPath: debKernelDir).filter { $0.hasPrefix("data.tar") }) ?? []
+    let contents = try FileManager.default.contentsOfDirectory(atPath: debKernelDir)
+    let dataTars = contents.filter { $0.hasPrefix("data.tar") }
+    guard !dataTars.isEmpty else {
+        throw MslError("ar x produced no data.tar.* — malformed deb at \(kernelDeb)")
+    }
     for tarball in dataTars {
         try procOrThrow("/usr/bin/tar", ["xf", "\(debKernelDir)/\(tarball)", "-C", tmpdir])
     }
@@ -492,7 +609,11 @@ WantedBy=multi-user.target
     let modulesDir = "\(tmpdir)/deb-modules"
     try procOrThrow("/bin/mkdir", ["-p", modulesDir])
     try procOrThrow(ar, ["x", modulesDeb], cwd: modulesDir)
-    let modDataTars = (try? FileManager.default.contentsOfDirectory(atPath: modulesDir).filter { $0.hasPrefix("data.tar") }) ?? []
+    let modContents = try FileManager.default.contentsOfDirectory(atPath: modulesDir)
+    let modDataTars = modContents.filter { $0.hasPrefix("data.tar") }
+    guard !modDataTars.isEmpty else {
+        throw MslError("ar x produced no data.tar.* — malformed modules deb at \(modulesDeb)")
+    }
     for tarball in modDataTars {
         try procOrThrow("/usr/bin/tar", ["xf", "\(modulesDir)/\(tarball)", "-C", modulesDir])
     }
@@ -583,26 +704,19 @@ func isValidExt4(_ path: String) -> Bool {
 }
 
 private func findMke2fs() -> String? {
-    let candidates = [
+    var candidates = [
         "/opt/homebrew/sbin/mke2fs",
         "/usr/local/opt/e2fsprogs/sbin/mke2fs",
         "/opt/local/sbin/mke2fs",
     ]
+    // Try dynamic brew prefix first
+    let brewPrefix = shellOutput("brew --prefix 2>/dev/null")
+    if !brewPrefix.isEmpty {
+        candidates.insert("\(brewPrefix)/sbin/mke2fs", at: 0)
+        candidates.insert("\(brewPrefix)/opt/e2fsprogs/sbin/mke2fs", at: 0)
+    }
     for c in candidates {
         if access(c, X_OK) == 0 { return c }
-    }
-    var st = stat()
-    if stat("/opt/homebrew/Cellar/e2fsprogs", &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "ls /opt/homebrew/Cellar/e2fsprogs/*/sbin/mke2fs 2>/dev/null | head -1"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        guard (try? task.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
-            return path
-        }
     }
     return nil
 }
@@ -630,6 +744,8 @@ private func findXQuartzApp() -> String? {
     return nil
 }
 
+var gSocatPID: pid_t = 0
+
 func ensureDisplayBridge() {
     // Skip in CI — no display server available
     if ProcessInfo.processInfo.environment["CI"] != nil { return }
@@ -638,6 +754,9 @@ func ensureDisplayBridge() {
     // socat bridges TCP 6000 -> /tmp/.X11-unix/X0 so the guest can reach it.
     let x11Socket = "/tmp/.X11-unix/X0"
     guard FileManager.default.fileExists(atPath: x11Socket) else { return }
+
+    // Check if we already have a tracked socat process
+    if gSocatPID > 0, kill(gSocatPID, 0) == 0 { return }
 
     // Check if something is already listening on 6000
     if shell("lsof -i :6000 >/dev/null 2>&1", quiet: true) == 0 { return }
@@ -653,7 +772,8 @@ func ensureDisplayBridge() {
         return
     }
 
-    shell("nohup socat TCP-LISTEN:6000,reuseaddr,fork UNIX-CONNECT:\(x11Socket) >/dev/null 2>&1 &")
+    let pidStr = shellOutput("nohup socat TCP-LISTEN:6000,reuseaddr,fork UNIX-CONNECT:\(x11Socket) >/dev/null 2>&1 & echo $!")
+    gSocatPID = pid_t(pidStr) ?? 0
     print("  X11 bridge started (port 6000).")
 }
 
@@ -689,11 +809,10 @@ private func ensureXQuartz() {
 /// Resolve the real directory containing the msl binary, following symlinks and PATH.
 private func resolveSelfDir() -> String {
     let selfPath = resolveBinaryPath()
-    var st = stat()
-    if lstat(selfPath, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK {
-        if let resolved = try? URL(resolvingAliasFileAt: URL(fileURLWithPath: selfPath)) {
-            return (resolved.path as NSString).deletingLastPathComponent
-        }
+    if let resolved = realpath(selfPath, nil) {
+        let rp = String(cString: resolved)
+        free(resolved)
+        return (rp as NSString).deletingLastPathComponent
     }
     return (selfPath as NSString).deletingLastPathComponent
 }
@@ -749,10 +868,20 @@ func parseKernelVersion(_ s: String) -> [Int] {
 }
 
 func discoverKernelVersions() -> [(String, String)] {
-    let url = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/"
-    guard let data = try? Data(contentsOf: URL(string: url)!),
-          let html = String(data: data, encoding: .utf8)
-    else { return [] }
+    let urlString = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/"
+    guard let url = URL(string: urlString) else { return [] }
+    var data: Data?
+    for attempt in 1...3 {
+        let sem = DispatchSemaphore(value: 0)
+        let task = URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 15)) { d, _, _ in
+            data = d; sem.signal()
+        }
+        task.resume()
+        _ = sem.wait(timeout: .now() + 20)
+        if data != nil { break }
+        if attempt < 3 { usleep(500_000 * useconds_t(attempt)) }
+    }
+    guard let data = data, let html = String(data: data, encoding: .utf8) else { return [] }
     var versions: [(String, String)] = []
     let pattern = #"linux-image-unsigned-([\w.+-]+)_([\w.+-]+)_arm64\.deb"#
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
@@ -778,6 +907,11 @@ func discoverKernelVersions() -> [(String, String)] {
     return versions
 }
 
+/// Shared pacman keyring initialization command used both during rootfs setup
+/// and as a fallback in the daemon's ensurePacmanKeyring(). All operations
+/// are chained with && so failure at any step stops execution.
+let pacmanKeySetupCommand = "rm -f /var/lib/pacman/db.lck && chown -R root:root /root/.gnupg 2>/dev/null && chmod 700 /root/.gnupg 2>/dev/null && pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy --noconfirm archlinuxarm-keyring ncurses iptables-nft && pacman -Syy && systemctl enable --now msl-firewall && touch /var/lib/msl-pacman-key.done"
+
 struct MslError: Error, LocalizedError {
     let message: String
     init(_ msg: String) { self.message = msg }
@@ -794,7 +928,10 @@ func readMslToken() -> Data? {
 /// Write the auth token to a VSOCK file descriptor. Called before sending
 /// the mode byte on every VSOCK connection.
 func writeMslToken(_ fd: Int32) -> Bool {
-    guard let token = readMslToken() else { return true }
+    guard let token = readMslToken() else {
+        mslLog("warning: VSOCK auth token not found at \(setupDataDir())/token — connections will not be authenticated")
+        return true
+    }
     var remaining = token
     while !remaining.isEmpty {
         let n = remaining.withUnsafeBytes { write(fd, $0.baseAddress, remaining.count) }

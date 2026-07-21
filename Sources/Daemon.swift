@@ -1,5 +1,6 @@
 import Foundation
 import Virtualization
+import os.lock
 
 class Daemon {
     let vm: MSLVM
@@ -9,6 +10,27 @@ class Daemon {
     var shouldKeepRunning = true
     var sigSourceTerm: DispatchSourceSignal?
     var sigSourceInt: DispatchSourceSignal?
+    var shellListenerSock: Int32 = -1
+
+    /// Cap concurrent shell/exec sessions to avoid exhausting the
+    /// guest's MAX_FORKS (64) or Swift's cooperative thread pool.
+    private var sessionLimit = os_unfair_lock()
+    private var activeSessions = 0
+    private let maxSessions = 64
+
+    private func acquireSession() -> Bool {
+        os_unfair_lock_lock(&sessionLimit)
+        defer { os_unfair_lock_unlock(&sessionLimit) }
+        guard activeSessions < maxSessions else { return false }
+        activeSessions += 1
+        return true
+    }
+
+    private func releaseSession() {
+        os_unfair_lock_lock(&sessionLimit)
+        activeSessions -= 1
+        os_unfair_lock_unlock(&sessionLimit)
+    }
 
     init(dataDir: String) {
         signal(SIGPIPE, SIG_IGN)
@@ -18,13 +40,12 @@ class Daemon {
         self.ipc = IPCServer(path: "\(dataDir)/msld.sock")
     }
 
-    var shellListenerSock: Int32 = -1
-
     func requestStop() {
         mslLog("received shutdown signal")
         sigSourceTerm?.cancel()
         sigSourceInt?.cancel()
         stopShellListener()
+        killSocat()
         Task {
             do {
                 try await vm.stop()
@@ -41,7 +62,6 @@ class Daemon {
             throw MslError("daemon already running (pid \(state.readPID() ?? 0))")
         }
 
-        // Signal-safe shutdown via DispatchSource (not raw signal handlers)
         let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         termSource.setEventHandler { [weak self] in self?.requestStop() }
         termSource.activate()
@@ -57,6 +77,7 @@ class Daemon {
             sigSourceTerm?.cancel()
             sigSourceInt?.cancel()
             stopShellListener()
+            killSocat()
             state.removePID()
         }
 
@@ -88,13 +109,16 @@ class Daemon {
 
         startShellListener()
 
+        // Set up immediate VM death notification via delegate callback
+        vm.onVMStopped = { [weak self] in
+            guard let self = self else { return }
+            mslLog("VM died — shutting down daemon")
+            self.shouldKeepRunning = false
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+
         while shouldKeepRunning {
             ensureDisplayBridge()
-            if FileManager.default.fileExists(atPath: "\(dataDir)/vm.dead") {
-                mslLog("VM died — shutting down daemon")
-                shouldKeepRunning = false
-                break
-            }
             try await Task.sleep(nanoseconds: 30 * NSEC_PER_SEC)
         }
 
@@ -111,8 +135,7 @@ class Daemon {
             return
         }
         mslLog("initializing pacman keyring")
-        let setup = "rm -f /var/lib/pacman/db.lck && chown -R root:root /root/.gnupg 2>/dev/null; chmod 700 /root/.gnupg 2>/dev/null; pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy --noconfirm archlinuxarm-keyring ncurses iptables-nft; pacman -Syy && systemctl enable --now msl-firewall && touch \(guestMarker)"
-        let (out, code) = await vm.execOnGuest(setup, timeout: 180)
+        let (out, code) = await vm.execOnGuest(pacmanKeySetupCommand, timeout: 180)
         if code == 0 { try? "".write(toFile: hostMarker, atomically: true, encoding: .utf8) }
         else { mslLog("pacman-key init failed (exit \(code)): \(String(data: out, encoding: .utf8) ?? "")") }
     }
@@ -129,7 +152,10 @@ class Daemon {
         let shellPath = "\(dataDir)/msld.shell.sock"
         unlink(shellPath)
         let sock = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard sock >= 0 else { return }
+        guard sock >= 0 else {
+            mslLog("shell listener socket creation failed: \(String(cString: strerror(errno)))")
+            return
+        }
         shellListenerSock = sock
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -139,15 +165,25 @@ class Daemon {
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, socklen_t(addrSize)) }
         }
-        guard bound == 0 else { close(sock); return }
+        guard bound == 0 else {
+            mslLog("shell listener bind failed: \(String(cString: strerror(errno)))")
+            close(sock)
+            shellListenerSock = -1
+            return
+        }
         listen(sock, 8)
         chmod(shellPath, 0o600)
 
-        DispatchQueue.global().async {
+        DispatchQueue.global().async { [weak self] in
             while true {
                 let client = accept(sock, nil, nil)
-                guard client >= 0 else { if errno == EINTR { continue }; break }
-                self.handleShellClient(client)
+                guard client >= 0 else {
+                    if errno != EINTR {
+                        mslLog("shell accept failed: \(String(cString: strerror(errno))) — listener exiting")
+                    }
+                    break
+                }
+                self?.handleShellClient(client)
             }
         }
     }
@@ -159,6 +195,11 @@ class Daemon {
                 case .success(let (handle, vsockFd)):
                     let cleanup = { DispatchQueue.main.async { self.vm.closeVsock(handle: handle) } }
                     DispatchQueue.global().async {
+                        guard self.acquireSession() else {
+                            close(client)
+                            return
+                        }
+                        defer { self.releaseSession() }
                         if !writeMslToken(vsockFd) {
                             cleanup()
                             close(client)
@@ -239,14 +280,19 @@ class Daemon {
         while Date() < deadline {
             do {
                 let (handle, fd) = try await vm.connectVsock(port: 9999)
+                defer { vm.closeVsock(handle: handle) }
                 if !writeMslToken(fd) { throw MslError("token write failed") }
+
+                // Set socket timeout so we don't block indefinitely
+                var tv = timeval(tv_sec: 15, tv_usec: 0)
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+
                 var mode: UInt8 = 0x00
                 var zero: UInt32 = 0
                 write(fd, &mode, 1)
                 write(fd, &zero, 4)
                 var buf: UInt32 = 0
                 let n = read(fd, &buf, 4)
-                vm.closeVsock(handle: handle)
                 if n == 0 {
                     mslLog("guest connected after \(attempts * 2)s")
                     return
@@ -264,6 +310,12 @@ class Daemon {
         }
 
         throw lastError ?? MslError("guest daemon not reachable after \(timeout)s")
+    }
+
+    private func killSocat() {
+        guard gSocatPID > 0 else { return }
+        kill(gSocatPID, SIGTERM)
+        gSocatPID = 0
     }
 
     private func handleRequest(_ data: Data, send: @escaping (Data) -> Void) {
@@ -296,96 +348,22 @@ class Daemon {
     }
 
     private func handleExec(command: String, send: @escaping (Data) -> Void) {
-        vm.connectVsock(port: 9999) { [self] result in
-            DispatchQueue.global().async { [self] in
-                switch result {
-                case .success(let (handle, fd)):
-                    defer { DispatchQueue.main.async { self.vm.closeVsock(handle: handle) } }
-
-                    if !writeMslToken(fd) {
-                        self.sendError(send, message: "VSOCK auth token write failed")
-                        self.sendDone(send)
-                        return
-                    }
-
-                    var reqData = Data()
-                    reqData.append(contentsOf: [0x00])
-                    var cmdLen = UInt32(command.utf8.count).bigEndian
-                    withUnsafeBytes(of: &cmdLen) { reqData.append(contentsOf: $0) }
-                    reqData.append(command.data(using: .utf8)!)
-                    var written = 0
-                    while written < reqData.count {
-                        let n = write(fd, (reqData as NSData).bytes + written, reqData.count - written)
-                        if n <= 0 { break }
-                        written += n
-                    }
-
-                    let totalBudgetSeconds: Double = 30
-                    let maxOutputBytes = 10 * 1024 * 1024
-                    let deadline = Date().addingTimeInterval(totalBudgetSeconds)
-                    var outBuf = [UInt8](repeating: 0, count: 65536)
-                    var allOutput = Data()
-                    var timedOut = false
-
-                    let flags = fcntl(fd, F_GETFL, 0)
-                    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-
-                    commandLoop: while true {
-                        let remaining = max(0.0, deadline.timeIntervalSinceNow)
-                        if remaining <= 0 { timedOut = true; break commandLoop }
-                        let (n, savedErrno) = outBuf.withUnsafeMutableBytes { ptr -> (Int, Int32) in
-                            let bytesRead = read(fd, ptr.baseAddress!, ptr.count)
-                            return (bytesRead, errno)
-                        }
-                        if n > 0 {
-                            if allOutput.count < maxOutputBytes {
-                                let room = maxOutputBytes - allOutput.count
-                                allOutput.append(outBuf, count: min(n, room))
-                                if allOutput.count >= maxOutputBytes { break commandLoop }
-                            }
-                        } else if n == 0 { break
-                        } else if savedErrno == EAGAIN || savedErrno == EWOULDBLOCK {
-                            usleep(10000)
-                            continue
-                        } else { break
-                        }
-                    }
-
-                    if timedOut {
-                        if !allOutput.isEmpty {
-                            self.sendOutput(send, data: allOutput)
-                        }
-                        self.sendExitCode(send, code: 255)
-                        self.sendDone(send)
-                        return
-                    }
-
-                    guard allOutput.count >= 4 else {
-                        self.sendDone(send)
-                        return
-                    }
-                    let exitOffset = allOutput.count - 4
-                    let outputData: Data
-                    if exitOffset > 0 {
-                        outputData = allOutput.withUnsafeBytes { ptr in
-                            Data(bytes: ptr.baseAddress!, count: exitOffset)
-                        }
-                    } else { outputData = Data() }
-                    let exitCode = allOutput.withUnsafeBytes { ptr in
-                        ptr.loadUnaligned(fromByteOffset: exitOffset, as: UInt32.self).bigEndian
-                    }
-
-                    if !outputData.isEmpty {
-                        self.sendOutput(send, data: outputData)
-                    }
-                    self.sendExitCode(send, code: exitCode)
-                    self.sendDone(send)
-
-                case .failure(let error):
-                    self.sendError(send, message: error.localizedDescription)
-                    self.sendDone(send)
-                }
+        // Delegate to the shared exec implementation on MSLVM.
+        // This avoids duplication and ensures a consistent timeout budget
+        // across host and guest (120s on both sides).
+        Task {
+            guard acquireSession() else {
+                sendError(send, message: "too many concurrent sessions")
+                sendDone(send)
+                return
             }
+            defer { releaseSession() }
+            let (output, exitCode) = await vm.execOnGuest(command, timeout: 120)
+            if !output.isEmpty {
+                self.sendOutput(send, data: output)
+            }
+            self.sendExitCode(send, code: exitCode)
+            self.sendDone(send)
         }
     }
 

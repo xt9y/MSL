@@ -8,18 +8,18 @@ private struct UncheckedVM: @unchecked Sendable {
     init(_ vm: VZVirtualMachine) { self.value = vm }
 }
 
-private struct UncheckedHandle: @unchecked Sendable {
-    let value: UnsafeMutableRawPointer
-    init(_ h: UnsafeMutableRawPointer) { self.value = h }
-}
-
-class MSLVM: NSObject {
+class MSLVM: NSObject, @unchecked Sendable {
     let dataDir: String
     let kernelPath: String
     let diskPath: String
 
     var vm: VZVirtualMachine?
     var vsock: MSLVSOCK?
+
+    /// Tracks whether vm.start() has resolved, so we can log if it
+    /// resolves after the caller has already handled a timeout.
+    private var startResolved = false
+    var onVMStopped: (() -> Void)?
 
     init(dataDir: String) {
         self.dataDir = dataDir
@@ -56,8 +56,11 @@ class MSLVM: NSObject {
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelURL)
         bootLoader.commandLine = "console=hvc0 root=/dev/vda rw init=/usr/lib/systemd/systemd"
 
-        guard let disk = try? VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false) else {
-            throw MslError("failed to open disk image at \(diskPath)")
+        let disk: VZDiskImageStorageDeviceAttachment
+        do {
+            disk = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
+        } catch {
+            throw MslError("failed to open disk image: \(error.localizedDescription)")
         }
         let storage = VZVirtioBlockDeviceConfiguration(attachment: disk)
 
@@ -80,7 +83,7 @@ class MSLVM: NSObject {
 
         vsock = MSLVSOCK(configuration: config)
 
-        let serialPath = "/tmp/msl-serial.log"
+        let serialPath = "\(NSTemporaryDirectory())msl-serial.log"
         FileManager.default.createFile(atPath: serialPath, contents: nil)
         let serialFH = FileHandle(forWritingAtPath: serialPath) ?? FileHandle.standardError
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -102,12 +105,18 @@ class MSLVM: NSObject {
     func start() async throws {
         guard let vm = vm else { throw MslError("VM not configured") }
         let uncheckedVM = UncheckedVM(vm)
+        startResolved = false
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     DispatchQueue.main.async {
                         uncheckedVM.value.start { result in
+                            if self.startResolved {
+                                mslLog("VM start completed after timeout — ignoring late result")
+                                return
+                            }
+                            self.startResolved = true
                             switch result {
                             case .success: cont.resume()
                             case .failure(let err): cont.resume(throwing: err)
@@ -119,6 +128,8 @@ class MSLVM: NSObject {
 
             group.addTask {
                 try await Task.sleep(nanoseconds: 30_000_000_000)
+                if self.startResolved { return }
+                self.startResolved = true
                 throw MslError("VM start timed out")
             }
 
@@ -161,8 +172,6 @@ class MSLVM: NSObject {
         vsock?.closeSocket(handle)
     }
 
-    /// Run a command in the guest over VSOCK (mode 0x00) and return
-    /// (combined stdout+stderr, exitCode). Synchronous, single connection.
     func execOnGuest(_ command: String, timeout: Double = 120) async -> (Data, UInt32) {
         guard let vsock = vsock else { return (Data(), 255) }
         let result: (UnsafeMutableRawPointer, Int32, Error?) = await withCheckedContinuation { cont in
@@ -188,7 +197,9 @@ class MSLVM: NSObject {
         reqData.append(command.data(using: .utf8) ?? Data())
         var written = 0
         while written < reqData.count {
-            let n = write(fd, (reqData as NSData).bytes + written, reqData.count - written)
+            let n = reqData.withUnsafeBytes { ptr in
+                write(fd, ptr.baseAddress! + written, reqData.count - written)
+            }
             if n <= 0 { return (Data(), 255) }
             written += n
         }
@@ -200,16 +211,21 @@ class MSLVM: NSObject {
         while true {
             let remaining = max(0.0, deadline.timeIntervalSinceNow)
             if remaining <= 0 { break }
+
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            var pret: Int32
+            repeat { pret = poll(&pfd, 1, 1000) } while pret < 0 && errno == EINTR
+            if pret < 0 { break }
+            if pret == 0 { continue }
+
             let (n, savedErrno) = outBuf.withUnsafeMutableBytes { ptr -> (Int, Int32) in
                 let bytesRead = read(fd, ptr.baseAddress!, ptr.count)
                 return (bytesRead, errno)
             }
             if n > 0 { allOutput.append(outBuf, count: n) }
             else if n == 0 { break }
-            else if savedErrno == EAGAIN || savedErrno == EWOULDBLOCK {
-                usleep(10000)
-                continue
-            } else { break }
+            else if savedErrno == EAGAIN || savedErrno == EWOULDBLOCK { continue }
+            else { break }
         }
         guard allOutput.count >= 4 else { return (allOutput, 255) }
         let exitOffset = allOutput.count - 4
@@ -235,6 +251,7 @@ extension MSLVSOCK: @unchecked Sendable {}
 extension MSLVM: VZVirtualMachineDelegate {
     private func markVMDead() {
         try? "dead".write(toFile: "\(dataDir)/vm.dead", atomically: true, encoding: .utf8)
+        if let cb = onVMStopped { cb() }
     }
 
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) {

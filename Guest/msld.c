@@ -13,6 +13,19 @@
 #include <pty.h>
 #include <termios.h>
 #include <pwd.h>
+#include <sys/time.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <fcntl.h>
+
+/*
+ * Trust boundary: This daemon runs inside the guest VM. Every connection
+ * is authenticated with a 32-byte random token shared with the host
+ * (~/.msl/token == /etc/msld-token). Once authenticated, the client is
+ * trusted to execute arbitrary shell commands (mode 0x00) or spawn an
+ * interactive shell (mode 0x01). There is no TLS or rate-limiting at
+ * this layer — the token is the sole access control.
+ */
 
 #define PORT 9999
 #define BUF_SIZE 65536
@@ -65,6 +78,10 @@ static int verify_token(int client_fd) {
     load_token();
     /* No token file = no auth (backward compat) */
     if (g_token_bytes <= 0) return 1;
+
+    /* Set a 10-second receive timeout on the socket for the token read */
+    struct timeval tv = {10, 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     unsigned char recv_token[TOKEN_SIZE];
     ssize_t total = 0;
@@ -149,7 +166,6 @@ static ssize_t safe_write(int fd, const void *buf, size_t len) {
 
 static void serve_client(int client_fd) {
     g_client_fd = client_fd;
-    probe_gateway();
 
     /* Auth: verify token before doing anything else. */
     if (!verify_token(client_fd)) {
@@ -198,9 +214,21 @@ static void serve_client(int client_fd) {
         tio.c_cc[VTIME]  = 0;
         cfsetispeed(&tio, B38400);
         cfsetospeed(&tio, B38400);
+
+        /* Block SIGCHLD around forkpty/waitpid to prevent the signal
+         * handler from reaping the pty child before our explicit wait. */
+        sigset_t old_sigchld, sigchld_block;
+        sigemptyset(&sigchld_block);
+        sigaddset(&sigchld_block, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &sigchld_block, &old_sigchld);
+
         int master_fd = -1;
         pid_t pid = forkpty(&master_fd, NULL, &tio, &ws);
-        if (pid < 0) { if (master_fd >= 0) close(master_fd); return; }
+        if (pid < 0) {
+            sigprocmask(SIG_SETMASK, &old_sigchld, NULL);
+            if (master_fd >= 0) close(master_fd);
+            return;
+        }
 
         if (pid == 0) {
             if (master_fd >= 0) close(master_fd);
@@ -281,8 +309,20 @@ static void serve_client(int client_fd) {
 
 shell_done:
         if (master_fd >= 0) close(master_fd);
+        /* Safety timeout: if the child doesn't exit within 120s, kill it */
+        struct sigaction sa_alrm_shell, sa_alrm_shell_old;
+        memset(&sa_alrm_shell, 0, sizeof(sa_alrm_shell));
+        sa_alrm_shell.sa_handler = handle_sigalrm;
+        sa_alrm_shell.sa_flags = SA_RESETHAND;
+        sigaction(SIGALRM, &sa_alrm_shell, &sa_alrm_shell_old);
+        g_cmd_pid = pid;
+        alarm(120);
         int status;
         waitpid(pid, &status, 0);
+        alarm(0);
+        g_cmd_pid = 0;
+        sigaction(SIGALRM, &sa_alrm_shell_old, NULL);
+        sigprocmask(SIG_SETMASK, &old_sigchld, NULL);
         return;
     }
 
@@ -329,6 +369,8 @@ shell_done:
         if (g_listen_fd > 2) close(g_listen_fd);
         if (client_fd > 2)   close(client_fd);
         if (g_display[0]) setenv("DISPLAY", g_display, 1);
+        /* Become a process group leader so kill(-pid, SIGKILL) works */
+        setpgid(0, 0);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -407,25 +449,77 @@ int main(void) {
     signal(SIGCHLD, handle_sigchld);
 
     load_token();
+    probe_gateway();
 
-    int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
-    g_listen_fd = fd;
-    if (fd < 0) { fprintf(stderr, "msld: socket: %s\n", strerror(errno)); return 1; }
-
+    int fd = -1;
     struct sockaddr_vm addr;
     memset(&addr, 0, sizeof(addr));
     addr.svm_family = AF_VSOCK;
     addr.svm_cid = VMADDR_CID_ANY;
     addr.svm_port = PORT;
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "msld: bind: %s\n", strerror(errno));
-        close(fd); return 1;
-    }
+    /* Retry VSOCK socket/bind/listen in case kernel modules are still
+     * being loaded.  Try to finit_module the VSOCK modules ourselves.
+     * The disk image has pre-decompressed .ko files for this purpose
+     * (zstd-compressed .ko.zst cannot be consumed by finit_module). */
+    struct utsname uts;
+    char modpath[320];
+    const char *mods[] = {"vsock",
+        "vmw_vsock_virtio_transport_common",
+        "vmw_vsock_virtio_transport", NULL};
+    int kver_ok = (uname(&uts) == 0);
 
-    if (listen(fd, 128) < 0) {
-        fprintf(stderr, "msld: listen: %s\n", strerror(errno));
-        close(fd); return 1;
+    for (int retry = 0; ; retry++) {
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        if (fd < 0) {
+            if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
+                /* Try loading the VSOCK kernel modules via finit_module.
+                 * Order matters: vsock → transport_common → transport.
+                 * The .ko files must be pre-decompressed in the image. */
+                if (kver_ok) {
+                    for (const char **m = mods; *m; m++) {
+                        snprintf(modpath, sizeof(modpath),
+                            "/usr/lib/modules/%s/kernel/net/vmw_vsock/%s.ko",
+                            uts.release, *m);
+                        int mfd = open(modpath, O_RDONLY);
+                        if (mfd >= 0) {
+                            syscall(SYS_finit_module, mfd, "", 0);
+                            close(mfd);
+                        }
+                    }
+                }
+                if (retry > 600) {
+                    fprintf(stderr, "msld: giving up on VSOCK after 5 min\n");
+                    return 1;
+                }
+                usleep(500000);
+                continue;
+            }
+            fprintf(stderr, "msld: socket: %s\n", strerror(errno));
+            return 1;
+        }
+
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            int e = errno;
+            close(fd);
+            if (e == EADDRNOTAVAIL || e == EAGAIN) {
+                usleep(500000);
+                continue;
+            }
+            fprintf(stderr, "msld: bind: %s\n", strerror(e));
+            return 1;
+        }
+
+        if (listen(fd, 128) < 0) {
+            int e = errno;
+            close(fd);
+            usleep(500000);
+            continue;
+        }
+
+        /* All three operations succeeded */
+        g_listen_fd = fd;
+        break;
     }
 
     sigset_t sigchld_set, sigchld_old;
