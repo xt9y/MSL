@@ -13,3 +13,4 @@ Sources/Version.swift
 *.xcuserdata
 *.xcworkspace
 xcuserdata/
+.release.sh
