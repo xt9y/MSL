@@ -34,7 +34,6 @@
 #define MAX_FORKS 64
 
 static int                g_listen_fd  = -1;
-static int                g_client_fd  = -1;
 static volatile sig_atomic_t g_child_count = 0;
 static char      g_display[64] = {0};
 static unsigned char g_token[TOKEN_SIZE] = {0};
@@ -165,8 +164,6 @@ static ssize_t safe_write(int fd, const void *buf, size_t len) {
 }
 
 static void serve_client(int client_fd) {
-    g_client_fd = client_fd;
-
     /* Auth: verify token before doing anything else. */
     if (!verify_token(client_fd)) {
         return;

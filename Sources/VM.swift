@@ -84,8 +84,14 @@ class MSLVM: NSObject, @unchecked Sendable {
         vsock = MSLVSOCK(configuration: config)
 
         let serialPath = "\(NSTemporaryDirectory())msl-serial.log"
-        FileManager.default.createFile(atPath: serialPath, contents: nil)
-        let serialFH = FileHandle(forWritingAtPath: serialPath) ?? FileHandle.standardError
+        // Create or append — never truncate, so crash logs survive restarts.
+        let serialFD = Darwin.open(serialPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        let serialFH: FileHandle
+        if serialFD >= 0 {
+            serialFH = FileHandle(fileDescriptor: serialFD, closeOnDealloc: true)
+        } else {
+            serialFH = .standardError
+        }
         let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
         serialPort.attachment = VZFileHandleSerialPortAttachment(
             fileHandleForReading: nil,
