@@ -5,6 +5,7 @@ PRODUCT = $(BUILD_DIR)/msl
 GUEST = $(BUILD_DIR)/msld
 VERSION_FILE = Sources/Version.swift
 GUEST_SRC = Guest/msld.c
+ZIG ?= zig
 
 SWIFT_SRCS = \
 	Sources/main.swift \
@@ -34,7 +35,7 @@ $(PRODUCT): $(VERSION_FILE) $(SWIFT_SRCS) $(OBJC_SRCS)
 
 $(GUEST): $(GUEST_SRC)
 	@mkdir -p $(BUILD_DIR)
-	zig cc -target aarch64-linux-musl -static -Os -s -o $@ $(GUEST_SRC)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -s -o $@ $(GUEST_SRC)
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -45,13 +46,16 @@ sign: $(PRODUCT)
 	codesign --entitlements Resources/msl.entitlements \
 		--force --sign "$(DEV_ID)" "$(PRODUCT)"
 
-test: $(PRODUCT) $(GUEST)
-	zig cc -target aarch64-linux-musl -static -Os -s \
-		-Wall -Wextra -Werror -o /dev/null $(GUEST_SRC)
+test: $(PRODUCT)
 	./build/msl version
 	./build/msl help | grep -q start
 	./build/msl help | grep -q shell
 	./build/msl help | grep -q exec
 	@echo "All smoke tests passed"
 
-.PHONY: all clean sign test $(VERSION_FILE)
+check-c: $(GUEST_SRC)
+	$(ZIG) cc -target aarch64-linux-musl -static -Os -s \
+		-Wall -Wextra -Werror -o /dev/null $(GUEST_SRC)
+	@echo "C strict check passed"
+
+.PHONY: all clean sign test check-c $(VERSION_FILE)
