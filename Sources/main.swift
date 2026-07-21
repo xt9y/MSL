@@ -192,7 +192,7 @@ func printHelp() {
     print("  setup              Download and prepare the VM disk image")
     print("  update             Re-download rootfs and rebuild disk image")
     print("  fix                Re-sign binary (restore virtualization entitlement)")
-    print("  upgrade            Update msl and msld via Homebrew")
+    print("  upgrade            Update msl and msld (runs brew update && brew upgrade)")
     print("  uninstall          Remove all msl data")
     print("  version            Show version")
     print("  help               Show this help")
@@ -340,7 +340,7 @@ func checkForUpdate() {
           let curParts = parseVersion(MSLVersion),
           let tagParts = parseVersion(String(tag.dropFirst())) else { return }
     if compareVersions(tagParts, curParts) == .orderedDescending {
-        fputs("msl: new version \(tag) available — update with 'brew upgrade msl msld'\n", stderr)
+        fputs("msl: new version \(tag) available — run 'msl upgrade'\n", stderr)
     }
 }
 
