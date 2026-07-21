@@ -2,6 +2,13 @@ import Foundation
 import Virtualization
 import os.lock
 
+/// Box to carry vsock connection result across task boundaries without
+/// triggering Swift 6 Sendable warnings for UnsafeMutableRawPointer.
+private final class VsockConnectBox: @unchecked Sendable {
+    var handle: UnsafeMutableRawPointer?
+    var fd: Int32 = -1
+}
+
 class Daemon {
     let vm: MSLVM
     var state: DaemonState
@@ -46,15 +53,8 @@ class Daemon {
         sigSourceInt?.cancel()
         stopShellListener()
         killSocat()
-        Task {
-            do {
-                try await vm.stop()
-            } catch {
-                mslLog("vm.stop error: \(error.localizedDescription)")
-            }
-            shouldKeepRunning = false
-            CFRunLoopStop(CFRunLoopGetMain())
-        }
+        shouldKeepRunning = false
+        CFRunLoopStop(CFRunLoopGetMain())
     }
 
     func run() async throws {
@@ -76,6 +76,7 @@ class Daemon {
         defer {
             sigSourceTerm?.cancel()
             sigSourceInt?.cancel()
+            ipc.stop()
             stopShellListener()
             killSocat()
             state.removePID()
@@ -99,15 +100,20 @@ class Daemon {
             throw error
         }
 
-        mslLog("VM ready")
-        try? "1".write(toFile: "\(dataDir)/daemon.ready", atomically: true, encoding: .utf8)
-        await ensurePacmanKeyring()
-
         try ipc.start { [weak self] requestData, send in
             self?.handleRequest(requestData, send: send)
         }
 
         startShellListener()
+
+        // Signal readiness *after* IPC + shell sockets are live, so
+        // the CLI's startDaemonInBackground loop doesn't find the
+        // marker before it can actually serve requests.
+        try? "1".write(toFile: "\(dataDir)/daemon.ready", atomically: true, encoding: .utf8)
+
+        // First-boot keyring init can take 2–3 minutes; run off the
+        // main actor so the daemon stays responsive during the wait.
+        Task.detached { await self.ensurePacmanKeyring() }
 
         // Set up immediate VM death notification via delegate callback
         vm.onVMStopped = { [weak self] in
@@ -119,7 +125,12 @@ class Daemon {
 
         while shouldKeepRunning {
             ensureDisplayBridge()
-            try await Task.sleep(nanoseconds: 30 * NSEC_PER_SEC)
+            // Use a short sleep so the daemon responds quickly to
+            // stop/shutdown signals (instead of blocking for 30s).
+            for _ in 0..<300 {
+                if !shouldKeepRunning { break }
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
         }
 
         mslLog("daemon shutting down")
@@ -279,7 +290,25 @@ class Daemon {
 
         while Date() < deadline {
             do {
-                let (handle, fd) = try await vm.connectVsock(port: 9999)
+                let handle: UnsafeMutableRawPointer
+                let fd: Int32
+                (handle, fd) = try await {
+                    let box = VsockConnectBox()
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask {
+                            let (h, f) = try await self.vm.connectVsock(port: 9999)
+                            box.handle = h
+                            box.fd = f
+                        }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: 15_000_000_000)
+                            throw MslError("connectVsock timed out")
+                        }
+                        try await group.next()!
+                        group.cancelAll()
+                    }
+                    return (box.handle!, box.fd)
+                }()
                 defer { vm.closeVsock(handle: handle) }
                 if !writeMslToken(fd) { throw MslError("token write failed") }
 
@@ -368,16 +397,8 @@ class Daemon {
     }
 
     private func handleStop(send: @escaping (Data) -> Void) {
-        Task {
-            do {
-                try await vm.stop()
-                sendDone(send)
-                shouldKeepRunning = false
-            } catch {
-                sendError(send, message: error.localizedDescription)
-                sendDone(send)
-            }
-        }
+        sendDone(send)
+        shouldKeepRunning = false
     }
 
     private func handleStatus(send: @escaping (Data) -> Void) {

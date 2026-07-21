@@ -123,9 +123,13 @@ func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws 
     gpgImport.standardInput = Pipe()
     gpgImport.standardError = Pipe()
     gpgImport.standardOutput = Pipe()
-    guard (try? gpgImport.run()) != nil else { return false }
+    try gpgImport.run()
     gpgImport.waitUntilExit()
-    guard gpgImport.terminationStatus == 0 else { return false }
+    guard gpgImport.terminationStatus == 0 else {
+        let errData = (gpgImport.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile() ?? Data()
+        let errMsg = String(data: errData, encoding: .utf8) ?? "unknown error"
+        throw MslError("GPG key import failed for \(keyFingerprint): \(errMsg)")
+    }
     let gpgVerify = Process()
     gpgVerify.executableURL = URL(fileURLWithPath: "/usr/bin/gpg")
     gpgVerify.arguments = ["--verify", sigPath, file]
