@@ -95,9 +95,10 @@ let archLinuxArmSigningKey = "68B3537F39A313B3E574D06777193F152BDBE6A6"
 
 /// Try to GPG-verify `file` against a detached signature at `sigURL`.
 /// Uses a temporary GNUPGHOME to avoid polluting the user's keyring.
+/// If `gnupgHome` is provided the keyring is reused (caller manages lifecycle).
 /// Returns true if verification succeeds or gpg is unavailable / sig not found.
 /// Throws if gpg is available but verification fails.
-func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws -> Bool {
+func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String, gnupgHome: String? = nil) throws -> Bool {
     guard proc("/usr/bin/gpg", ["--version"]) == 0 else { return false }
     guard let sigURL = URL(string: sigURL) else {
         throw MslError("invalid signature URL: \(sigURL)")
@@ -111,11 +112,18 @@ func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws 
     let sigPath = "\(file).sig"
     try sigData.write(to: URL(fileURLWithPath: sigPath), options: .atomic)
     defer { try? FileManager.default.removeItem(atPath: sigPath) }
-    let gnupgHome = "\(NSTemporaryDirectory())msl-gpghome.\(getpid())"
-    try? FileManager.default.createDirectory(atPath: gnupgHome, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(atPath: gnupgHome) }
+
+    let ownHome = gnupgHome == nil
+    let gpgHome = gnupgHome ?? "\(NSTemporaryDirectory())msl-gpghome.\(getpid())"
+    if ownHome {
+        try? FileManager.default.createDirectory(atPath: gpgHome, withIntermediateDirectories: true)
+    }
+    defer {
+        if ownHome { try? FileManager.default.removeItem(atPath: gpgHome) }
+    }
+
     var env = ProcessInfo.processInfo.environment
-    env["GNUPGHOME"] = gnupgHome
+    env["GNUPGHOME"] = gpgHome
     let gpgImport = Process()
     gpgImport.executableURL = URL(fileURLWithPath: "/usr/bin/gpg")
     gpgImport.arguments = ["--keyserver", "keyserver.ubuntu.com", "--recv-keys", keyFingerprint]
@@ -153,22 +161,29 @@ func verifyWithGPG(file: String, sigURL: String, keyFingerprint: String) throws 
 }
 
 /// Verify a kernel .deb against Ubuntu's signed SHA256SUMS.
-func verifyDebWithGPG(debPath: String, debURL: String) throws {
+/// If `shaStr` is provided the caller already fetched SHA256SUMS (avoids a duplicate fetch).
+/// If `gnupgHome` is provided the GPG keyring is reused from the caller.
+func verifyDebWithGPG(debPath: String, debURL: String, shaStr: String? = nil, gnupgHome: String? = nil) throws {
     let baseURL = debURL.dropLast(debURL.split(separator: "/").last?.count ?? 0)
     let shaURL = "\(baseURL)SHA256SUMS"
     let sigURL = "\(baseURL)SHA256SUMS.gpg"
     let filename = debURL.split(separator: "/").last.map(String.init) ?? ""
 
-    // Fetch SHA256SUMS and signature
-    guard let shaData = try? Data(contentsOf: URL(string: String(shaURL))!),
-          let shaStr = String(data: shaData, encoding: .utf8) else {
-        mslLog("warning: could not fetch SHA256SUMS for kernel verification — skipping GPG check")
-        return
+    let shaContent: String
+    if let s = shaStr {
+        shaContent = s
+    } else {
+        guard let shaData = try? Data(contentsOf: URL(string: String(shaURL))!),
+              let s = String(data: shaData, encoding: .utf8) else {
+            mslLog("warning: could not fetch SHA256SUMS for kernel verification — skipping GPG check")
+            return
+        }
+        shaContent = s
     }
 
     // Find the line for our file
     var expectedSha: String?
-    for line in shaStr.split(separator: "\n") {
+    for line in shaContent.split(separator: "\n") {
         if line.hasSuffix("  \(filename)") || line.hasSuffix(" *\(filename)") {
             expectedSha = line.split(separator: " ").first.map(String.init)
             break
@@ -185,9 +200,8 @@ func verifyDebWithGPG(debPath: String, debURL: String) throws {
     }
 
     // Verify the SHA256SUMS signature with Ubuntu's signing key
-    // Ubuntu's archive signing key fingerprint
     let ubuntuKey = "871920D1991BC93C"
-    _ = try verifyWithGPG(file: String(shaURL), sigURL: String(sigURL), keyFingerprint: ubuntuKey)
+    _ = try verifyWithGPG(file: String(shaURL), sigURL: String(sigURL), keyFingerprint: ubuntuKey, gnupgHome: gnupgHome)
 }
 
 /// Download a URL to a file with retry, resume, and sha256 verification.
@@ -243,6 +257,30 @@ func sha256File(_ path: String) -> String {
     return output.split(separator: " ").first.map(String.init) ?? ""
 }
 
+/// Download with artifact caching. If `expectedSha256` is set and a cached
+/// copy with that hash exists under ~/.msl/cache/, it is copied instead of
+/// re-downloaded. After download the artifact is cached for future runs.
+func downloadWithCache(urls: [String], to destPath: String, expectedSha256: String?) throws {
+    let cacheDir = "\(setupDataDir())/cache"
+    if let sha = expectedSha256 {
+        let cachedPath = "\(cacheDir)/\(sha)"
+        if FileManager.default.fileExists(atPath: cachedPath) {
+            let actual = sha256File(cachedPath)
+            if actual == sha {
+                print("  Using cached copy.")
+                try FileManager.default.copyItem(atPath: cachedPath, toPath: destPath)
+                return
+            }
+            try? FileManager.default.removeItem(atPath: cachedPath)
+        }
+    }
+    try downloadWithChecksum(urls: urls, to: destPath, expectedSha256: expectedSha256)
+    if let sha = expectedSha256 {
+        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+        try? FileManager.default.copyItem(atPath: destPath, toPath: "\(cacheDir)/\(sha)")
+    }
+}
+
 /// Check available disk space. Throws if less than `requiredGB` GB is free.
 func checkDiskSpace(requiredGB: Int, at path: String) throws {
     var fs = statfs()
@@ -293,7 +331,6 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
     try FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
 
     if !keepDisk && fileExists(kernelPath) && isValidExt4(diskPath) {
-        // Warn if the user passed flags that would be silently ignored.
         if diskSizeGB != 8 || ramSizeGB != 2 || cpuCores != 2 {
             print("MSL: Already configured — flags ignored (re-run with --force to re-create)")
         }
@@ -328,35 +365,193 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
         "https://eu.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz",
     ]
     let sha256URL = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.sha256"
+    let ar = "/usr/bin/ar"
 
-    var expectedSha: String? = nil
-    if ProcessInfo.processInfo.environment["MSL_NO_VERIFY"] == nil {
-        guard let shaURL = URL(string: sha256URL) else {
-            throw MslError("invalid sha256 URL: \(sha256URL)")
-        }
-        do {
-            let shaData = try Data(contentsOf: shaURL)
-            guard let shaStr = String(data: shaData, encoding: .utf8) else {
-                throw MslError("sha256 response not valid UTF-8")
+    // Shared GNUPGHOME: import each unique key once, verify all three signatures.
+    let gnupgHome = "\(NSTemporaryDirectory())msl-gpghome.\(getpid())"
+    try? FileManager.default.createDirectory(atPath: gnupgHome, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: gnupgHome) }
+
+    // ----------------------------------------------------------------
+    // Phase 1 — Parallel: rootfs SHA fetch + kernel version discovery + SHA256SUMS fetch
+    // ----------------------------------------------------------------
+    var expectedSha: String?
+    var discoveredVersions: [(String, String)] = []
+    var sha256SumsStr: String?
+    var phase1Err: Error?
+
+    let p1 = DispatchGroup()
+
+    p1.enter()
+    DispatchQueue.global().async {
+        defer { p1.leave() }
+        if ProcessInfo.processInfo.environment["MSL_NO_VERIFY"] == nil {
+            guard let shaURL = URL(string: sha256URL) else {
+                phase1Err = MslError("invalid sha256 URL: \(sha256URL)"); return
             }
-            expectedSha = shaStr.split(separator: " ").first.map(String.init)
-            if expectedSha == nil {
-                throw MslError("failed to parse sha256 checksum from \(sha256URL)")
+            do {
+                let shaData = try Data(contentsOf: shaURL)
+                guard let shaStr = String(data: shaData, encoding: .utf8) else {
+                    phase1Err = MslError("sha256 response not valid UTF-8"); return
+                }
+                expectedSha = shaStr.split(separator: " ").first.map(String.init)
+                if expectedSha == nil {
+                    phase1Err = MslError("failed to parse sha256 checksum from \(sha256URL)"); return
+                }
+            } catch {
+                print("  warning: could not fetch sha256 checksum — proceeding without verification")
+                print("           (\(error.localizedDescription))")
             }
-        } catch {
-            print("  warning: could not fetch sha256 checksum — proceeding without verification")
-            print("           (\(error.localizedDescription))")
-            // Note: sha256 is fetched from archlinuxarm.org, same origin as one
-            // of the tarball mirrors. Same-origin compromise defeats both checks.
-            // GPG verification (below) provides independent trust.
         }
     }
 
-    try downloadWithChecksum(urls: mirrors, to: tarballPath, expectedSha256: expectedSha)
+    p1.enter()
+    DispatchQueue.global().async {
+        defer { p1.leave() }
+        let all = discoverKernelVersions()
+        discoveredVersions = all.filter { ver, _ in
+            let parts = parseKernelVersion(ver)
+            return parts.count >= 2 && parts[0] == 6 && parts[1] >= 8 && parts[1] <= 12
+        }
+    }
 
+    p1.wait()
+    if let e = phase1Err { throw e }
+
+    let kernelVersions: [(String, String)]
+    if !discoveredVersions.isEmpty {
+        kernelVersions = discoveredVersions
+    } else {
+        mslLog("kernel auto-discovery failed — using hardcoded fallback versions")
+        kernelVersions = [
+            ("6.8.0-53-generic", "6.8.0-53.55"),
+            ("6.8.0-51-generic", "6.8.0-51.53"),
+            ("6.8.0-45-generic", "6.8.0-45.47"),
+        ]
+    }
+
+    // Fetch SHA256SUMS once for both kernel and modules debs (same directory).
+    // This runs after discovery because we need the exact kernel URL to parse.
+    // We do it in-line rather than in p1 because the URL depends on the version.
+    let kernelDebURLs = kernelVersions.map { (ver, pkgRev) -> (String, String) in
+        let k = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-\(ver)_\(pkgRev)_arm64.deb"
+        let m = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(ver)_\(pkgRev)_arm64.deb"
+        return (k, m)
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2 — Parallel: download rootfs + kernel debs
+    // ----------------------------------------------------------------
+    var kernelDownloaded = false
+    var kernelVer = ""
+    var kernelDebURL = ""
+    var modulesDebURL = ""
+    let kernelDeb = "\(tmpdir)/kernel.deb"
+    let modulesDeb = "\(tmpdir)/modules.deb"
+    var phase2Err: Error?
+
+    let p2 = DispatchGroup()
+
+    p2.enter()
+    DispatchQueue.global().async {
+        defer { p2.leave() }
+        do {
+            try downloadWithCache(urls: mirrors, to: tarballPath, expectedSha256: expectedSha)
+        } catch {
+            phase2Err = error
+        }
+    }
+
+    p2.enter()
+    DispatchQueue.global().async {
+        defer { p2.leave() }
+        for (idx, (ver, _)) in kernelVersions.enumerated() {
+            let (kURL, mURL) = kernelDebURLs[idx]
+            let base = kURL.dropLast(kURL.split(separator: "/").last?.count ?? 0)
+            let shaStr = sha256SumsStr ?? { () -> String? in
+                if let d = try? Data(contentsOf: URL(string: "\(base)SHA256SUMS")!) {
+                    return String(data: d, encoding: .utf8)
+                }
+                return nil
+            }()
+
+            let kernelSha: String?
+            let modulesSha: String?
+            if let s = shaStr {
+                let kFile = kURL.split(separator: "/").last.map(String.init) ?? ""
+                let mFile = mURL.split(separator: "/").last.map(String.init) ?? ""
+                var ks: String?; var ms: String?
+                for line in s.split(separator: "\n") {
+                    if line.hasSuffix("  \(kFile)") || line.hasSuffix(" *\(kFile)") {
+                        ks = line.split(separator: " ").first.map(String.init)
+                    }
+                    if line.hasSuffix("  \(mFile)") || line.hasSuffix(" *\(mFile)") {
+                        ms = line.split(separator: " ").first.map(String.init)
+                    }
+                }
+                kernelSha = ks
+                modulesSha = ms
+            } else {
+                kernelSha = nil
+                modulesSha = nil
+            }
+            // Fallback: per-file .sha256 companions
+            let finalKernelSha = kernelSha ?? (try? Data(contentsOf: URL(string: "\(kURL).sha256")!)).flatMap { d in
+                String(data: d, encoding: .utf8)?.split(separator: " ").first.map(String.init)
+            }
+            let finalModulesSha = modulesSha ?? (try? Data(contentsOf: URL(string: "\(mURL).sha256")!)).flatMap { d in
+                String(data: d, encoding: .utf8)?.split(separator: " ").first.map(String.init)
+            }
+
+            // Store SHA256SUMS string for GPG verification step
+            if sha256SumsStr == nil { sha256SumsStr = shaStr }
+
+            // Download kernel and modules debs in parallel
+            let dd = DispatchGroup()
+            var kErr: Error?
+            var mErr: Error?
+            dd.enter()
+            DispatchQueue.global().async {
+                defer { dd.leave() }
+                do {
+                    try downloadWithCache(urls: [kURL], to: kernelDeb, expectedSha256: finalKernelSha)
+                } catch { kErr = error }
+            }
+            dd.enter()
+            DispatchQueue.global().async {
+                defer { dd.leave() }
+                do {
+                    try downloadWithCache(urls: [mURL], to: modulesDeb, expectedSha256: finalModulesSha)
+                } catch { mErr = error }
+            }
+            dd.wait()
+
+            if kErr == nil && mErr == nil {
+                kernelDownloaded = true
+                kernelVer = ver
+                kernelDebURL = kURL
+                modulesDebURL = mURL
+                print("  Kernel \(ver) downloaded.")
+                return
+            }
+            try? FileManager.default.removeItem(atPath: kernelDeb)
+            try? FileManager.default.removeItem(atPath: modulesDeb)
+            if idx == kernelVersions.count - 1 {
+                phase2Err = MslError("failed to download kernel from all versions")
+            }
+        }
+    }
+
+    p2.wait()
+    if let e = phase2Err { throw e }
+    guard kernelDownloaded else { throw MslError("failed to download kernel") }
+
+    // ----------------------------------------------------------------
+    // Phase 3 — GPG verify (shared keyring, single SHA256SUMS fetch)
+    // ----------------------------------------------------------------
     let sigURL = "\(sha256URL).sig"
     do {
-        if try verifyWithGPG(file: tarballPath, sigURL: sigURL, keyFingerprint: archLinuxArmSigningKey) {
+        if try verifyWithGPG(file: tarballPath, sigURL: sigURL, keyFingerprint: archLinuxArmSigningKey, gnupgHome: gnupgHome) {
             print("  GPG signature verified.")
         }
     } catch {
@@ -364,6 +559,24 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
         throw error
     }
 
+    for (label, deb, url) in [("kernel", kernelDeb, kernelDebURL), ("modules", modulesDeb, modulesDebURL)] {
+        do {
+            try verifyDebWithGPG(debPath: deb, debURL: url, shaStr: sha256SumsStr, gnupgHome: gnupgHome)
+            mslLog("\(label) GPG signature verified")
+        } catch {
+            mslLog("\(label) GPG verification failed: \(error.localizedDescription)")
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4 — Parallel: extract & configure rootfs + extract kernel/mods
+    // ----------------------------------------------------------------
+    // Kick off kernel extraction on a background thread while configuring rootfs.
+    var kernelExtractErr: Error?
+
+    let p4 = DispatchGroup()
+
+    // Rootfs extraction + configuration (on main thread)
     print("  Extracting rootfs...")
     fflush(stdout)
     _ = shell("tar xzf '\(tarballPath)' -C '\(tmpdir)' 2>&1")
@@ -373,6 +586,93 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
     }
     try? FileManager.default.removeItem(atPath: tarballPath)
 
+    // Kernel extraction runs in parallel with rootfs configuration
+    p4.enter()
+    DispatchQueue.global().async {
+        defer { p4.leave() }
+        do {
+            let debKernelDir = "\(tmpdir)/deb-kernel"
+            try procOrThrow("/bin/mkdir", ["-p", debKernelDir])
+            try procOrThrow(ar, ["x", kernelDeb], cwd: debKernelDir)
+            let contents = try FileManager.default.contentsOfDirectory(atPath: debKernelDir)
+            let dataTars = contents.filter { $0.hasPrefix("data.tar") }
+            guard !dataTars.isEmpty else {
+                kernelExtractErr = MslError("ar x produced no data.tar.* — malformed deb at \(kernelDeb)"); return
+            }
+            for tarball in dataTars {
+                try procOrThrow("/usr/bin/tar", ["xf", "\(debKernelDir)/\(tarball)", "-C", tmpdir])
+            }
+            try? FileManager.default.removeItem(atPath: kernelDeb)
+
+            let vmlinuz = "\(tmpdir)/boot/vmlinuz-\(kernelVer)"
+            _ = shell("gunzip -c '\(vmlinuz)' > '\(kernelPath)' 2>/dev/null")
+            if !fileExists(kernelPath) {
+                _ = shell("cp '\(vmlinuz)' '\(kernelPath)' 2>/dev/null")
+            }
+            guard fileExists(kernelPath) else {
+                kernelExtractErr = MslError("kernel extraction failed — \(kernelPath) is missing or empty"); return
+            }
+            print("  Kernel \(kernelVer) extracted.")
+        } catch {
+            kernelExtractErr = error
+        }
+    }
+
+    p4.enter()
+    DispatchQueue.global().async {
+        defer { p4.leave() }
+        do {
+            let modulesDir = "\(tmpdir)/deb-modules"
+            try procOrThrow("/bin/mkdir", ["-p", modulesDir])
+            try procOrThrow(ar, ["x", modulesDeb], cwd: modulesDir)
+            let modContents = try FileManager.default.contentsOfDirectory(atPath: modulesDir)
+            let modDataTars = modContents.filter { $0.hasPrefix("data.tar") }
+            guard !modDataTars.isEmpty else {
+                kernelExtractErr = MslError("ar x produced no data.tar.* — malformed modules deb at \(modulesDeb)"); return
+            }
+            for tarball in modDataTars {
+                try procOrThrow("/usr/bin/tar", ["xf", "\(modulesDir)/\(tarball)", "-C", modulesDir])
+            }
+            try? FileManager.default.removeItem(atPath: modulesDeb)
+
+            let modSrc = "\(modulesDir)/usr/lib/modules"
+            let modSrcFallback = "\(modulesDir)/lib/modules"
+            if FileManager.default.fileExists(atPath: modSrc) {
+                shell("rm -rf '\(tmpdir)/usr/lib/modules/\(kernelVer)' 2>/dev/null; cp -r '\(modSrc)/\(kernelVer)' '\(tmpdir)/usr/lib/modules/' 2>/dev/null || true")
+            } else if FileManager.default.fileExists(atPath: modSrcFallback) {
+                shell("rm -rf '\(tmpdir)/usr/lib/modules/\(kernelVer)' 2>/dev/null; cp -r '\(modSrcFallback)/\(kernelVer)' '\(tmpdir)/usr/lib/modules/' 2>/dev/null || true")
+            }
+            let modTarget = "\(tmpdir)/usr/lib/modules/\(kernelVer)"
+            let vsockDir = "\(modTarget)/kernel/net/vmw_vsock"
+            let ext: String
+            if fileExists("\(vsockDir)/vsock.ko.zst") {
+                ext = ".ko.zst"
+            } else if fileExists("\(vsockDir)/vsock.ko") {
+                ext = ".ko"
+            } else {
+                ext = ".ko"
+            }
+            let dep = """
+            kernel/net/vmw_vsock/vsock.ko\(ext):
+            kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko\(ext): kernel/net/vmw_vsock/vsock.ko\(ext)
+            kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko\(ext): kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko\(ext)
+
+            """
+            shell("mkdir -p '\(modTarget)' 2>/dev/null")
+            try? dep.write(toFile: "\(modTarget)/modules.dep", atomically: true, encoding: .utf8)
+            try? "\n".write(toFile: "\(modTarget)/modules.alias", atomically: true, encoding: .utf8)
+            try? "\n".write(toFile: "\(modTarget)/modules.symbols", atomically: true, encoding: .utf8)
+            try? "\n".write(toFile: "\(modTarget)/modules.softdep", atomically: true, encoding: .utf8)
+            let vsockConf = "vsock\nvmw_vsock_virtio_transport\n"
+            try? vsockConf.write(toFile: "\(tmpdir)/etc/modules-load.d/vsock.conf", atomically: true, encoding: .utf8)
+            print("  Kernel modules installed.")
+            try? FileManager.default.removeItem(atPath: modulesDir)
+        } catch {
+            kernelExtractErr = error
+        }
+    }
+
+    // Configure system while kernel/modules extract in parallel
     print("  Configuring system...")
     print("  WARNING: root account has no password. Do not enable SSH")
     print("           without setting a password inside the VM first.")
@@ -388,8 +688,6 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
     try bashrc.write(toFile: "\(tmpdir)/root/.bashrc", atomically: true, encoding: .utf8)
     let bashProfile = "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n"
     try bashProfile.write(toFile: "\(tmpdir)/root/.bash_profile", atomically: true, encoding: .utf8)
-    // Force Mesa software rendering (llvmpipe/lavapipe) system-wide.
-    // LP_NUM_THREADS matches the guest CPU count for best performance.
     let environment = "LIBGL_ALWAYS_SOFTWARE=1\n__GLX_VENDOR_LIBRARY_NAME=mesa\nVK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json\nLP_NUM_THREADS=\(cpuCores)\nXDG_RUNTIME_DIR=/run/user/0\n"
     try environment.write(toFile: "\(tmpdir)/etc/environment", atomically: true, encoding: .utf8)
     try? FileManager.default.createDirectory(atPath: "\(tmpdir)/etc/profile.d", withIntermediateDirectories: true)
@@ -397,9 +695,6 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
     try mesaProfile.write(toFile: "\(tmpdir)/etc/profile.d/msl-mesa.sh", atomically: true, encoding: .utf8)
     try? FileManager.default.createDirectory(atPath: "\(tmpdir)/run/user/0", withIntermediateDirectories: true)
 
-    // Guest firewall: drop all inbound on eth0 except established/related.
-    // This is defense-in-depth; Virtualization.framework NAT already blocks
-    // inbound from the LAN by default.
     try FileManager.default.createDirectory(atPath: "\(tmpdir)/etc/systemd/system", withIntermediateDirectories: true)
     let fwService = """
 [Unit]
@@ -420,15 +715,8 @@ WantedBy=multi-user.target
     try fwService.write(toFile: "\(tmpdir)/etc/systemd/system/msl-firewall.service", atomically: true, encoding: .utf8)
     try shellOrThrow("mkdir -p '\(tmpdir)/etc/systemd/system/multi-user.target.wants' && ln -sf /etc/systemd/system/msl-firewall.service '\(tmpdir)/etc/systemd/system/multi-user.target.wants/msl-firewall.service'")
 
-    // Generate a random auth token for VSOCK connections. Written to both
-    // the host (~/.msl/token) and the guest rootfs (/etc/msld-token).
-    // Every VSOCK connection must send this token before the mode byte,
-    // preventing a rogue guest process from impersonating msld.
-    // When keepDisk is true, preserve the existing host token (the guest
-    // inside arch.img still has the matching value).
     let tokenPath = "\(dataDir)/token"
     if keepDisk, let existing = try? Data(contentsOf: URL(fileURLWithPath: tokenPath)), existing.count == 32 {
-        // Keep existing token — guest inside preserved arch.img still has it
     } else {
         var tokenBytes = [UInt8](repeating: 0, count: 32)
         let randomFD = open("/dev/urandom", O_RDONLY)
@@ -452,15 +740,9 @@ WantedBy=multi-user.target
         fputs("  Warning: msld not found — run 'brew install msld' first\n", stderr)
     }
 
-    // Script to load VSOCK modules before starting msld.
-    // Tries modprobe first (uses modules.dep for the running kernel).
-    // Falls back to insmod with both .ko.zst (Ubuntu) and .ko (Arch) formats.
     let loadModulesScript = """
     #!/bin/sh
-    # Log startup to kernel ring buffer for diagnostics
     echo "msld-wrapper: starting, uname=$(uname -r)" > /dev/kmsg 2>/dev/null
-
-    # Try modprobe first (uses modules.dep)
     modprobe vsock 2>/dev/null && modprobe vmw_vsock_virtio_transport 2>/dev/null
     rc=$?
     if [ $rc -eq 0 ]; then
@@ -468,8 +750,6 @@ WantedBy=multi-user.target
     else
         echo "msld-wrapper: modprobe failed, trying insmod" > /dev/kmsg 2>/dev/null
     fi
-
-    # Fallback: try insmod with both .ko.zst (Ubuntu) and .ko (Arch) formats
     if ! lsmod 2>/dev/null | grep -q vsock; then
         echo "msld-wrapper: vsock not loaded, attempting insmod" > /dev/kmsg 2>/dev/null
         for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
@@ -488,7 +768,6 @@ WantedBy=multi-user.target
             done
         done
     fi
-
     echo "msld-wrapper: starting msld" > /dev/kmsg 2>/dev/null
     exec /usr/local/bin/msld "$@"
     """
@@ -532,175 +811,15 @@ WantedBy=multi-user.target
     try shellOrThrow("mkdir -p '\(tmpdir)/etc/systemd/system/multi-user.target.wants' && ln -sf /etc/systemd/system/msl-pacman-key.service '\(tmpdir)/etc/systemd/system/multi-user.target.wants/msl-pacman-key.service'")
     shell("mkdir -p '\(tmpdir)/var/lib'")
 
-    print("  Adding kernel...")
-    fflush(stdout)
+    // Wait for kernel/modules extraction to complete
+    p4.wait()
+    if let e = kernelExtractErr { throw e }
 
-    func sha256ForDeb(url: String) -> String? {
-        // Ubuntu only publishes directory-level SHA256SUMS, not per-file .sha256.
-        // Try the real path first to avoid a guaranteed 404 on every kernel download.
-        let base = url.dropLast(url.split(separator: "/").last?.count ?? 0)
-        if let data = try? Data(contentsOf: URL(string: "\(base)SHA256SUMS")!),
-           let str = String(data: data, encoding: .utf8) {
-            let filename = url.split(separator: "/").last.map(String.init) ?? ""
-            for line in str.split(separator: "\n") {
-                if line.hasSuffix("  \(filename)") || line.hasSuffix(" *\(filename)") {
-                    return line.split(separator: " ").first.map(String.init)
-                }
-            }
-        }
-        // Fallback: some mirrors may serve per-file .sha256 companions.
-        if let data = try? Data(contentsOf: URL(string: "\(url).sha256")!),
-           let str = String(data: data, encoding: .utf8) {
-            return str.split(separator: " ").first.map(String.init)
-        }
-        return nil
-    }
-
-    // Prefer known-working kernel versions (6.8.x from Ubuntu Noble, gzip raw format).
-    // Auto-discovery from the pool may pick newer kernels (6.17+, 7.x) that use
-    // PE32+ EFI format, which is incompatible with VZLinuxBootLoader.
-    let discovered = discoverKernelVersions().filter { ver, _ in
-        let parts = parseKernelVersion(ver)
-        // Accept kernels 6.8 through 6.12 (gzip raw format, known to work;
-        // newer kernels use PE32+ EFI format incompatible with VZLinuxBootLoader)
-        return parts.count >= 2 && parts[0] == 6 && parts[1] >= 8 && parts[1] <= 12
-    }
-    let kernelVersions: [(String, String)]
-    if !discovered.isEmpty {
-        kernelVersions = discovered
-    } else {
-        mslLog("kernel auto-discovery failed — using hardcoded fallback versions")
-        kernelVersions = [
-            ("6.8.0-53-generic", "6.8.0-53.55"),
-            ("6.8.0-51-generic", "6.8.0-51.53"),
-            ("6.8.0-45-generic", "6.8.0-45.47"),
-        ]
-    }
-    var kernelDownloaded = false
-    var kernelVer = ""
-    let kernelDeb = "\(tmpdir)/kernel.deb"
-    let modulesDeb = "\(tmpdir)/modules.deb"
-    let ar = "/usr/bin/ar"
-
-    for (ver, pkgRev) in kernelVersions {
-        let kernelDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-\(ver)_\(pkgRev)_arm64.deb"
-        let modulesDebURL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-\(ver)_\(pkgRev)_arm64.deb"
-        do {
-            let kernelSha = sha256ForDeb(url: kernelDebURL)
-            let modulesSha = sha256ForDeb(url: modulesDebURL)
-            try downloadWithChecksum(urls: [kernelDebURL], to: kernelDeb, expectedSha256: kernelSha)
-            try downloadWithChecksum(urls: [modulesDebURL], to: modulesDeb, expectedSha256: modulesSha)
-            // GPG-verify both kernel and modules debs against Ubuntu's signed checksums
-            // Modules carry the VSOCK kernel modules that form the host-guest trust
-            // boundary — skipping verification here would be a critical blind spot.
-            for (label, deb, url) in [("kernel", kernelDeb, kernelDebURL), ("modules", modulesDeb, modulesDebURL)] {
-                do {
-                    try verifyDebWithGPG(debPath: deb, debURL: url)
-                    mslLog("\(label) GPG signature verified")
-                } catch {
-                    mslLog("\(label) GPG verification failed: \(error.localizedDescription)")
-                    // Non-fatal: SHA256 already matched; GPG is defense-in-depth
-                }
-            }
-            kernelVer = ver
-            kernelDownloaded = true
-            print("  Kernel \(ver) downloaded.")
-            break
-        } catch {
-            try? FileManager.default.removeItem(atPath: kernelDeb)
-            try? FileManager.default.removeItem(atPath: modulesDeb)
-            continue
-        }
-    }
-
-    guard kernelDownloaded else {
-        throw MslError("failed to download kernel")
-    }
-    let debKernelDir = "\(tmpdir)/deb-kernel"
-    try procOrThrow("/bin/mkdir", ["-p", debKernelDir])
-    try procOrThrow(ar, ["x", kernelDeb], cwd: debKernelDir)
-    let contents = try FileManager.default.contentsOfDirectory(atPath: debKernelDir)
-    let dataTars = contents.filter { $0.hasPrefix("data.tar") }
-    guard !dataTars.isEmpty else {
-        throw MslError("ar x produced no data.tar.* — malformed deb at \(kernelDeb)")
-    }
-    for tarball in dataTars {
-        try procOrThrow("/usr/bin/tar", ["xf", "\(debKernelDir)/\(tarball)", "-C", tmpdir])
-    }
-    try? FileManager.default.removeItem(atPath: kernelDeb)
-    let vmlinuz = "\(tmpdir)/boot/vmlinuz-\(kernelVer)"
-    // Try gunzip decompression first (older kernels); fall back to direct copy (modern PE32+ EFI kernels)
-    _ = shell("gunzip -c '\(vmlinuz)' > '\(kernelPath)' 2>/dev/null")
-    if !fileExists(kernelPath) {
-        _ = shell("cp '\(vmlinuz)' '\(kernelPath)' 2>/dev/null")
-    }
-    guard fileExists(kernelPath) else {
-        throw MslError("kernel extraction failed — \(kernelPath) is missing or empty")
-    }
-    print("  Kernel \(kernelVer) extracted.")
-
-    // Extract modules from the modules deb for VSOCK support in the rootfs.
-    let modulesDir = "\(tmpdir)/deb-modules"
-    try procOrThrow("/bin/mkdir", ["-p", modulesDir])
-    try procOrThrow(ar, ["x", modulesDeb], cwd: modulesDir)
-    let modContents = try FileManager.default.contentsOfDirectory(atPath: modulesDir)
-    let modDataTars = modContents.filter { $0.hasPrefix("data.tar") }
-    guard !modDataTars.isEmpty else {
-        throw MslError("ar x produced no data.tar.* — malformed modules deb at \(modulesDeb)")
-    }
-    for tarball in modDataTars {
-        try procOrThrow("/usr/bin/tar", ["xf", "\(modulesDir)/\(tarball)", "-C", modulesDir])
-    }
-    try? FileManager.default.removeItem(atPath: modulesDeb)
-
-    // Move Ubuntu kernel modules into rootfs for VSOCK support.
-    // Modern kernels use /usr/lib/modules/; older kernels use /lib/modules/.
-    let modSrc = "\(modulesDir)/usr/lib/modules"
-    let modSrcFallback = "\(modulesDir)/lib/modules"
-    if FileManager.default.fileExists(atPath: modSrc) {
-        shell("rm -rf '\(tmpdir)/usr/lib/modules/\(kernelVer)' 2>/dev/null; cp -r '\(modSrc)/\(kernelVer)' '\(tmpdir)/usr/lib/modules/' 2>/dev/null || true")
-    } else if FileManager.default.fileExists(atPath: modSrcFallback) {
-        shell("rm -rf '\(tmpdir)/usr/lib/modules/\(kernelVer)' 2>/dev/null; cp -r '\(modSrcFallback)/\(kernelVer)' '\(tmpdir)/usr/lib/modules/' 2>/dev/null || true")
-    }
-    let modTarget = "\(tmpdir)/usr/lib/modules/\(kernelVer)"
-    // Generate minimal modules metadata for VSOCK
-    // Detect whether the extracted modules use .ko.zst or .ko so we
-    // generate a correct modules.dep regardless of the shipping format.
-    let vsockDir = "\(modTarget)/kernel/net/vmw_vsock"
-    let ext: String
-    if fileExists("\(vsockDir)/vsock.ko.zst") {
-        ext = ".ko.zst"
-    } else if fileExists("\(vsockDir)/vsock.ko") {
-        ext = ".ko"
-    } else {
-        ext = ".ko"    // best guess; insmod fallback in the wrapper covers both
-    }
-    let dep = """
-    kernel/net/vmw_vsock/vsock.ko\(ext):
-    kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko\(ext): kernel/net/vmw_vsock/vsock.ko\(ext)
-    kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko\(ext): kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko\(ext)
-
-    """
-    shell("mkdir -p '\(modTarget)' 2>/dev/null")
-    try? dep.write(toFile: "\(modTarget)/modules.dep", atomically: true, encoding: .utf8)
-    try? "\n".write(toFile: "\(modTarget)/modules.alias", atomically: true, encoding: .utf8)
-    try? "\n".write(toFile: "\(modTarget)/modules.symbols", atomically: true, encoding: .utf8)
-    try? "\n".write(toFile: "\(modTarget)/modules.softdep", atomically: true, encoding: .utf8)
-    let vsockConf = "vsock\nvmw_vsock_virtio_transport\n"
-    try? vsockConf.write(toFile: "\(tmpdir)/etc/modules-load.d/vsock.conf", atomically: true, encoding: .utf8)
-    print("  Kernel modules installed.")
-    try? FileManager.default.removeItem(atPath: modulesDir)
-
-    // Only chmod the specific files we need to be readable; avoid blanket +r
-    // over the entire rootfs which could alter permissions on sensitive files.
     shell("chmod -R +r '\(tmpdir)/usr/local/bin' '\(tmpdir)/etc' '\(tmpdir)/boot' '\(tmpdir)/lib' 2>/dev/null")
 
     if !keepDisk {
         print("  Creating disk image (\(diskSizeGB)GB)...")
         fflush(stdout)
-        // Strip setuid/setgid bits and ensure readability — mke2fs on macOS
-        // cannot copy files with restricted permissions when running as
-        // a non-root user.
         shell("chmod -R a-s,u+r '\(tmpdir)' 2>/dev/null || true")
         try procOrThrow(mke2fs, ["-t", "ext4", "-d", tmpdir, diskPath, "\(diskSizeGB)G"])
         print("  Disk image: \(diskPath)")
@@ -901,21 +1020,22 @@ private func disableX11AccessControl() {
     guard FileManager.default.isExecutableFile(atPath: xauthBin),
           FileManager.default.isExecutableFile(atPath: xhostBin) else { return }
 
+    // The daemon process may not have DISPLAY set.  xauth and xhost need it.
+    let displayEnv = "DISPLAY=:0"
+
     // Add xauth entries for the current system hostname so xhost can
     // authenticate.  `hostname` may return a FQDN that differs from the
     // entries XQuartz originally wrote (e.g. ".fritz.box" vs ".local").
     let hostname = shellOutput("/bin/hostname")
     if !hostname.isEmpty {
-        // Get the first cookie from ~/.Xauthority
-        let cookie = shellOutput("\(xauthBin) list 2>/dev/null | head -1 | awk '{print $NF}'")
+        let cookie = shellOutput("\(displayEnv) \(xauthBin) list 2>/dev/null | head -1 | awk '{print $NF}'")
         if !cookie.isEmpty {
-            _ = shell("\(xauthBin) add \(hostname)/unix:0 MIT-MAGIC-COOKIE-1 \(cookie) 2>/dev/null", quiet: true)
-            _ = shell("\(xauthBin) add \(hostname):0 MIT-MAGIC-COOKIE-1 \(cookie) 2>/dev/null", quiet: true)
+            _ = shell("\(displayEnv) \(xauthBin) add \(hostname)/unix:0 MIT-MAGIC-COOKIE-1 \(cookie) 2>/dev/null", quiet: true)
+            _ = shell("\(displayEnv) \(xauthBin) add \(hostname):0 MIT-MAGIC-COOKIE-1 \(cookie) 2>/dev/null", quiet: true)
         }
     }
 
-    // Now xhost + should succeed
-    _ = shell("\(xhostBin) + >/dev/null 2>&1", quiet: true)
+    _ = shell("\(displayEnv) \(xhostBin) + >/dev/null 2>&1", quiet: true)
 }
 
 private func ensureXQuartz() {

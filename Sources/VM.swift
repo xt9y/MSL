@@ -54,7 +54,7 @@ class MSLVM: NSObject, @unchecked Sendable {
         }
 
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelURL)
-        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw init=/usr/lib/systemd/systemd"
+        bootLoader.commandLine = "console=hvc0 root=/dev/vda rw quiet loglevel=3 init=/usr/lib/systemd/systemd"
 
         let disk: VZDiskImageStorageDeviceAttachment
         do {

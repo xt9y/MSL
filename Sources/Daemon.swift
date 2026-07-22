@@ -335,6 +335,8 @@ class Daemon {
         let deadline = Date(timeIntervalSinceNow: Double(timeout))
         var lastError: Error?
         var attempts = 0
+        var delay: UInt64 = 250_000_000 // 250ms initial
+        let maxDelay: UInt64 = 2_000_000_000 // 2s ceiling
 
         while Date() < deadline {
             do {
@@ -371,18 +373,21 @@ class Daemon {
                 var buf: UInt32 = 0
                 let n = read(fd, &buf, 4)
                 if n == 0 {
-                    mslLog("guest connected after \(attempts * 2)s")
+                    let elapsed = Int(Date().timeIntervalSince(deadline.addingTimeInterval(-Double(timeout))))
+                    mslLog("guest connected after \(elapsed)s")
                     return
                 }
                 attempts += 1
-                try await Task.sleep(nanoseconds: 2_000_000_000)
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, maxDelay)
             } catch {
                 lastError = error
                 attempts += 1
                 if attempts % 15 == 0 {
-                    mslLog("waiting for guest... (\(attempts * 2)s)")
+                    mslLog("waiting for guest... (\(Int(Date().timeIntervalSince(deadline.addingTimeInterval(-Double(timeout)))))s)")
                 }
-                try await Task.sleep(nanoseconds: 2_000_000_000)
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, maxDelay)
             }
         }
 
