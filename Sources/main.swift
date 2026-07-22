@@ -323,14 +323,18 @@ func startDaemonInBackground() {
     // Wait for VM to be actually reachable (up to 120s for first boot)
     let readyPath = "\(dataDir)/daemon.ready"
     var vmReady = false
-    for _ in 0..<1200 {
+    fputs("MSL: Booting VM (up to 2 min)...", stderr)
+    fflush(stderr)
+    for i in 0..<1200 {
         if FileManager.default.fileExists(atPath: readyPath) {
             try? FileManager.default.removeItem(atPath: readyPath)
             vmReady = true
             break
         }
+        if i > 0 && i % 50 == 0 { fputs(".", stderr); fflush(stderr) }
         usleep(100_000)
     }
+    fputs("\n", stderr)
     if vmReady { print("MSL \(MSLVersion) started (pid \(pid))") }
     else { fputs("MSL: VM booting in background (pid \(pid)) — use 'msl shell' to connect\n", stderr) }
 }
