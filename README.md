@@ -60,6 +60,45 @@ msl exec "pacman -S --noconfirm xorg-xeyes"
 msl exec xeyes
 ```
 
+### Vulkan (software)
+
+Mesa's `llvmpipe` provides Vulkan over CPU — works out of the box:
+
+```bash
+msl exec vulkaninfo --summary
+msl exec vkcube
+```
+
+Performance is ~1–5 FPS for complex scenes (fine for UI toolkits, not for games).
+
+### EGL-based GL
+
+Apps compiled with an EGL backend (bypassing GLX) render via Mesa's software rasterizer:
+
+```bash
+# GLFW apps with EGL support
+msl exec "GLFW_BACKEND=egl ./myapp"
+```
+
+### Chromium
+
+```bash
+msl exec "pacman -S --noconfirm chromium"
+msl exec "chromium --no-sandbox"
+```
+
+(The `--no-sandbox` flag is needed because Chromium's sandbox is incompatible with the VM's root-only environment.)
+
+### Environment variables set in the guest
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `DISPLAY` | `{gateway}:0` | Forwarded X11 display |
+| `LIBGL_ALWAYS_SOFTWARE` | `1` | Force Mesa software rendering |
+| `VK_ICD_FILENAMES` | `/usr/share/vulkan/icd.d/lvp_icd.json` | Use llvmpipe Vulkan ICD |
+| `LP_NUM_THREADS` | (CPU count) | llvmpipe thread count |
+| `XDG_RUNTIME_DIR` | `/run/user/0` | Mesa/Vulkan runtime dir |
+
 
 ## Build from source
 
@@ -81,33 +120,39 @@ brew untap xt9y/MSL      # removes the tap
 
 ## Known Limitations
 
-**Not working right now**
-- GPU-accelerated apps (OpenGL/Vulkan) fail or silently fall back to software
-  rendering — the guest has no GPU device (`/dev/dri` doesn't exist). Only
-  plain X11 core-protocol drawing (like `xeyes`) works today.
-- Apps relying on `MIT-SHM` or `DRI3`/`Present` (shared-memory frame handoff)
-  don't get the fast path — Xlib disables SHM over a non-local display, so
-  these fall back to slow `PutImage`, if they fall back at all.
+### Works
 
-**Will never be implemented**
-- GPU acceleration (Vulkan/OpenGL) of any kind. True GPU passthrough isn't
-  possible on Apple Silicon (the host needs the GPU for its own display),
-  and full virtio-gpu 3D acceleration (Venus/virglrenderer → MoltenVK)
-  requires a custom device with shared-memory command streaming that
-  `Virtualization.framework` doesn't expose — projects that have this
-  (e.g. Podman/`krunkit`) had to abandon `Virtualization.framework` entirely
-  for raw `Hypervisor.framework`.
-- Reliable indirect GLX hardware acceleration through XQuartz — indirect GLX
-  support has been scaled back in modern X servers for security reasons, so
-  this isn't achievable regardless of what msl does guest-side.
-- Screen mirroring / RDP-style remote desktop of the whole guest — msl aims
-  for native per-window integration via X11, not a virtual monitor.
+- **Plain X11 apps** (`xeyes`, terminal emulators, basic GUI toolkits) — yes, via the XQuartz TCP bridge.
+- **Vulkan (software)** — **yes**, Mesa `llvmpipe` provides a fully-conformant Vulkan 1.4 implementation
+  (CPU-only, ~1–5 FPS). See [GUI applications](#gui-applications) above.
+- **EGL-native GL** — **yes**, apps compiled with an EGL backend bypass GLX and render via Mesa's
+  software rasterizer. This is the recommended path for GLFW/GLUT applications.
+- **`msl shell`** — interactive PTY shell with job control, resize handling, DISPLAY forwarding.
+- **`msl exec`** — run commands, capture stdout/stderr + exit code.
+- **VSOCK auth** — 32-byte random token authenticates every connection between host and guest.
 
-**Might be added, no promises**
-- Forcing software GL (Mesa `llvmpipe`) in the guest so simple 3D apps
-  (`glxgears`, basic GL UI toolkits) render via CPU and composite through the
-  existing X11 bridge like any other window. Slow, but real, and doesn't
-  require touching the VM architecture.
+### Not working
+
+- **GLX (OpenGL over X11)** — XQuartz does not implement the GLX server extension, so any app
+  using legacy GLX (`glxgears`, unmodified GLUT, etc.) will fail with `GLXBadContext`.
+  *Fix:* recompile the app with an EGL backend, or use the Zink translation layer
+  (`MESA_LOADER_DRIVER_OVERRIDE=zink` — experimental, not all apps work).
+- **MIT-SHM / DRI3 / Present** — shared-memory frame handoff is disabled by Xlib over a
+  non-local (`:0.0` TCP) display. Renders fall back to `PutImage`.
+- **Hardware GPU acceleration** — Apple Silicon has no GPU passthrough mechanism.
+  `/dev/dri` doesn't exist in the guest. All rendering is CPU-based.
+
+### Will never be implemented
+
+- True GPU passthrough / virtio-gpu 3D (Venus/virglrenderer → MoltenVK) — requires
+  custom device support that `Virtualization.framework` doesn't expose.
+- Indirect GLX hardware acceleration through XQuartz — GLX indirect support has been
+  scaled back in modern X servers for security reasons.
+- Screen mirroring / RDP-style remote desktop of the whole guest — msl targets native
+  per-window integration via X11.
+
+### Might be added, no promises
+
 - ARM64-native package mirror selection / faster first-boot.
 - Multiple simultaneous VMs / named instances.
 - Snapshotting or pausing VM state instead of full shutdown/boot.
