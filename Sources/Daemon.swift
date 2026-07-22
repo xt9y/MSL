@@ -97,12 +97,15 @@ class Daemon {
         }
 
         try? FileManager.default.removeItem(atPath: "\(dataDir)/vm.dead")
-        try? "pre-bridge".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
+        let logPath = mslLogPath
+        try? "pre-bridge log=\(logPath)".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
         ensureDisplayBridge()
         try? "post-bridge".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
 
         mslLog("booting VM")
+        try? "after-mslLog".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
         try vm.boot()
+        try? "after-boot".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
 
         do { try await vm.start()
         } catch {
