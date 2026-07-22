@@ -1,6 +1,6 @@
 import Foundation
 
-let mslLogPath = "\(NSTemporaryDirectory())msl-daemon.log"
+let mslLogPath = "/tmp/msl-daemon.log"
 let mslLogQueue = DispatchQueue(label: "msl.log")
 let mslLogFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
@@ -706,6 +706,7 @@ WantedBy=multi-user.target
         print("  Disk image: \(diskPath)")
     } else {
         print("  Keeping existing disk image.")
+        updateDiskImage(diskPath: diskPath, dataDir: dataDir, tokenPath: tokenPath, msldPath: msldPath)
     }
 
     let config = VMConfig(diskSizeGB: diskSizeGB, ramSizeGB: ramSizeGB, cpuCores: cpuCores)
@@ -777,6 +778,58 @@ private func ensureMke2fs() throws -> String {
     shell("brew install e2fsprogs 2>/dev/null", quiet: true)
     if let p = findMke2fs() { return p }
     throw MslError("mke2fs not found — install e2fsprogs via 'brew install e2fsprogs'")
+}
+
+private func findDebugfs() -> String? {
+    let brewPrefix = shellOutput("brew --prefix 2>/dev/null")
+    var candidates = [
+        "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
+        "/opt/homebrew/sbin/debugfs",
+        "/usr/local/opt/e2fsprogs/sbin/debugfs",
+        "/usr/local/sbin/debugfs",
+        "/opt/local/sbin/debugfs",
+    ]
+    if !brewPrefix.isEmpty {
+        candidates.insert("\(brewPrefix)/sbin/debugfs", at: 0)
+        candidates.insert("\(brewPrefix)/opt/e2fsprogs/sbin/debugfs", at: 0)
+    }
+    for c in candidates {
+        if access(c, X_OK) == 0 { return c }
+    }
+    return nil
+}
+
+private func updateDiskImage(diskPath: String, dataDir: String, tokenPath: String, msldPath: String?) {
+    guard let debugfs = findDebugfs() else {
+        fputs("  warning: debugfs not found (install e2fsprogs) — token not updated in disk image\n", stderr)
+        return
+    }
+    guard FileManager.default.fileExists(atPath: diskPath) else {
+        fputs("  warning: disk image not found at \(diskPath) — nothing to update\n", stderr)
+        return
+    }
+
+    // Update VSOCK auth token inside the disk image
+    if FileManager.default.fileExists(atPath: tokenPath) {
+        let tmpToken = "/tmp/msl-token-update"
+        try? FileManager.default.removeItem(atPath: tmpToken)
+        try? FileManager.default.copyItem(atPath: tokenPath, toPath: tmpToken)
+        if FileManager.default.fileExists(atPath: tmpToken) {
+            _ = shell("echo 'write \(tmpToken) /etc/msld-token\nchmod 600 /etc/msld-token' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
+            try? FileManager.default.removeItem(atPath: tmpToken)
+        }
+    }
+
+    // Update msld binary inside the disk image
+    if let msld = msldPath, FileManager.default.fileExists(atPath: msld) {
+        let tmpMsld = "/tmp/msl-msld-update"
+        try? FileManager.default.removeItem(atPath: tmpMsld)
+        try? FileManager.default.copyItem(atPath: msld, toPath: tmpMsld)
+        if FileManager.default.fileExists(atPath: tmpMsld) {
+            _ = shell("echo 'write \(tmpMsld) /usr/local/bin/msld\nchmod 755 /usr/local/bin/msld' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
+            try? FileManager.default.removeItem(atPath: tmpMsld)
+        }
+    }
 }
 
 private func findXQuartzApp() -> String? {

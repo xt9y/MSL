@@ -97,32 +97,10 @@ class Daemon {
         }
 
         try? FileManager.default.removeItem(atPath: "\(dataDir)/vm.dead")
-        do {
-            let fm = FileManager.default
-            var isDir = ObjCBool(false)
-            let exists = fm.fileExists(atPath: mslLogPath, isDirectory: &isDir)
-            let canWrite = fm.isWritableFile(atPath: mslLogPath)
-            let tmpDir = NSTemporaryDirectory()
-            let tmpWritable = fm.isWritableFile(atPath: tmpDir)
-            try "log=\(mslLogPath) exists=\(exists) isDir=\(isDir.boolValue) canWrite=\(canWrite) tmp=\(tmpDir) tmpW=\(tmpWritable)".write(toFile: "/tmp/msl-dbg-1", atomically: true, encoding: .utf8)
-
-            // Test FileHandle directly
-            let testPath = "/tmp/msl-test-fh"
-            _ = fm.createFile(atPath: testPath, contents: nil)
-            let fh = FileHandle(forWritingAtPath: testPath)
-            try "fh_ok=\(fh != nil)".write(toFile: "/tmp/msl-dbg-2", atomically: true, encoding: .utf8)
-            fh?.closeFile()
-        } catch {
-            try? "debug_error=\(error)".write(toFile: "/tmp/msl-dbg-e", atomically: true, encoding: .utf8)
-        }
-
         ensureDisplayBridge()
-        try? "post-bridge".write(toFile: "/tmp/msl-dbg-3", atomically: true, encoding: .utf8)
 
         mslLog("booting VM")
-        try? "did-log".write(toFile: "/tmp/msl-dbg-4", atomically: true, encoding: .utf8)
         try vm.boot()
-        try? "did-boot".write(toFile: "/tmp/msl-dbg-5", atomically: true, encoding: .utf8)
 
         do { try await vm.start()
         } catch {
