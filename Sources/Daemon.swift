@@ -97,7 +97,9 @@ class Daemon {
         }
 
         try? FileManager.default.removeItem(atPath: "\(dataDir)/vm.dead")
+        try? "pre-bridge".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
         ensureDisplayBridge()
+        try? "post-bridge".write(toFile: "/tmp/msl-debug", atomically: true, encoding: .utf8)
 
         mslLog("booting VM")
         try vm.boot()
