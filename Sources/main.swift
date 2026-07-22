@@ -346,7 +346,7 @@ func main() {
     let args = CommandLine.arguments
 
     if args.count == 1 {
-        print("MSL — macOS Subsystem for Linux")
+        print("MSL — MacOS Subsystem for Linux")
         print("Run 'msl help' for usage.")
         exit(0)
     }
@@ -396,6 +396,9 @@ func main() {
         startDaemonInBackground()
 
     case "--start-daemon":
+        // Detach from the terminal's process group so Ctrl-C in
+        // the parent doesn't kill the background daemon.
+        setpgid(0, 0)
         let daemon = Daemon(dataDir: dataDir)
         DispatchQueue.main.async {
             Task {
