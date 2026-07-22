@@ -809,13 +809,14 @@ private func updateDiskImage(diskPath: String, dataDir: String, tokenPath: Strin
         return
     }
 
-    // Update VSOCK auth token inside the disk image
+    // Update VSOCK auth token inside the disk image.
+    // debugfs refuses to overwrite an existing file, so remove it first.
     if FileManager.default.fileExists(atPath: tokenPath) {
         let tmpToken = "/tmp/msl-token-update"
         try? FileManager.default.removeItem(atPath: tmpToken)
         try? FileManager.default.copyItem(atPath: tokenPath, toPath: tmpToken)
         if FileManager.default.fileExists(atPath: tmpToken) {
-            _ = shell("echo 'write \(tmpToken) /etc/msld-token\nchmod 600 /etc/msld-token' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
+            _ = shell("echo 'rm /etc/msld-token\nwrite \(tmpToken) /etc/msld-token\nchmod 600 /etc/msld-token' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
             try? FileManager.default.removeItem(atPath: tmpToken)
         }
     }
@@ -826,7 +827,7 @@ private func updateDiskImage(diskPath: String, dataDir: String, tokenPath: Strin
         try? FileManager.default.removeItem(atPath: tmpMsld)
         try? FileManager.default.copyItem(atPath: msld, toPath: tmpMsld)
         if FileManager.default.fileExists(atPath: tmpMsld) {
-            _ = shell("echo 'write \(tmpMsld) /usr/local/bin/msld\nchmod 755 /usr/local/bin/msld' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
+            _ = shell("echo 'rm /usr/local/bin/msld\nwrite \(tmpMsld) /usr/local/bin/msld\nchmod 755 /usr/local/bin/msld' | \(debugfs) -w '\(diskPath)' 2>/dev/null", quiet: false)
             try? FileManager.default.removeItem(atPath: tmpMsld)
         }
     }
