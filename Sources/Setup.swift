@@ -359,14 +359,14 @@ func ensureSetup(diskSizeGB: Int = 8, ramSizeGB: Int = 2, cpuCores: Int = 2, kee
 
     let tarballPath = "\(tmpdir)/rootfs.tar.gz"
     let mirrors = [
-        "https://github.com/xt9y/MSL/releases/download/v0.7.22/ArchLinuxARM-aarch64-latest-configured.tar.gz",
+        "https://github.com/xt9y/MSL/releases/download/rootfs-configured/ArchLinuxARM-aarch64-latest-configured.tar.gz",
         "https://github.com/xt9y/MSL/releases/download/rootfs/ArchLinuxARM-aarch64-latest.tar.gz",
         "https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz",
         "https://mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz",
         "https://eu.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz",
     ]
     let sha256URL = "https://archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.sha256"
-    let preconfiguredShaURL = "https://github.com/xt9y/MSL/releases/download/v0.7.22/ArchLinuxARM-aarch64-latest-configured.tar.gz.sha256"
+    let preconfiguredShaURL = "https://github.com/xt9y/MSL/releases/download/rootfs-configured/ArchLinuxARM-aarch64-latest-configured.tar.gz.sha256"
     let ar = "/usr/bin/ar"
 
     // Shared GNUPGHOME: import each unique key once, verify all three signatures.
