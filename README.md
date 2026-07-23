@@ -44,7 +44,7 @@ msl status       # check if the VM is running
 msl shell        # interactive shell (like SSH)
 msl exec "cmd"   # run a command and print output
 msl update       # download latest kernel/modules/Arch image
-msl fix          # re-sign entitlements (fixes "permission denied")
+msl setup --force # re-create disk image from scratch
 ```
 
 ## GUI applications

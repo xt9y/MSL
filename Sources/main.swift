@@ -191,7 +191,6 @@ func printHelp() {
     print("  shell              interactive shell (like SSH)")
     print("  exec <cmd>         run a command and print output")
     print("  update             download latest kernel/modules/Arch image")
-    print("  fix                re-sign entitlements (fixes permission issues)")
     print("  uninstall          remove all msl data")
     print("  version            show version")
     print()
@@ -227,73 +226,6 @@ func resolveBinaryPath() -> String {
         if access(full, X_OK) == 0 { return full }
     }
     return exe
-}
-
-func fixEntitlements() throws {
-    let exe = resolveBinaryPath()
-    let plist: String
-    let candidates = [
-        URL(fileURLWithPath: CommandLine.arguments[0])
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Resources/msl.entitlements"),
-        URL(fileURLWithPath: "/opt/homebrew/share/msl/msl.entitlements"),
-        URL(fileURLWithPath: "/usr/local/share/msl/msl.entitlements"),
-    ]
-    var found: String?
-    for c in candidates {
-        if let data = try? Data(contentsOf: c),
-           let str = String(data: data, encoding: .utf8) {
-            found = str
-            break
-        }
-    }
-    guard let str = found else {
-        throw MslError("Cannot find msl.entitlements — reinstall with 'brew reinstall msl'")
-    }
-    plist = str
-
-    let currentIdentity: String
-    let diag = Process()
-    diag.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-    diag.arguments = ["-d", "-v", exe]
-    let diagOut = Pipe()
-    diag.standardOutput = diagOut
-    diag.standardError = FileHandle(forWritingAtPath: "/dev/null")
-    if (try? diag.run()) != nil {
-        diag.waitUntilExit()
-        if diag.terminationStatus == 0 {
-            let data = diagOut.fileHandleForReading.readDataToEndOfFile()
-            let out = String(data: data, encoding: .utf8) ?? ""
-            if let authLine = out.split(separator: "\n").first(where: { $0.hasPrefix("Authority=") }) {
-                currentIdentity = String(authLine.dropFirst("Authority=".count))
-            } else {
-                currentIdentity = "-"
-            }
-        } else {
-            currentIdentity = "-"
-        }
-    } else {
-        currentIdentity = "-"
-    }
-
-    let tmp = "/tmp/msl-entitlements.plist"
-    try plist.write(toFile: tmp, atomically: true, encoding: .utf8)
-    defer { try? FileManager.default.removeItem(atPath: tmp) }
-    let cs = Process()
-    cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-    cs.arguments = ["--entitlements", tmp, "--force", "--sign", currentIdentity, exe]
-    cs.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-    cs.standardError = FileHandle(forWritingAtPath: "/dev/null")
-    try cs.run()
-    cs.waitUntilExit()
-    guard cs.terminationStatus == 0 else {
-        throw MslError("Codesign failed (exit \(cs.terminationStatus))")
-    }
-    if VZVirtualMachine.isSupported {
-        print("MSL: Virtualization entitlement restored — restart daemon with 'msl start'")
-    } else {
-        throw MslError("Virtualization entitlement still missing — try 'brew reinstall msl'")
-    }
 }
 
 func startDaemonInBackground() {
@@ -556,51 +488,6 @@ func main() {
             try FileManager.default.removeItem(atPath: d)
             print("Removed \(d)")
             print("Run 'brew uninstall msl msld' to remove the binaries.")
-        } catch {
-            fputs("MSL: \(error.localizedDescription)\n", stderr)
-            exit(1)
-        }
-
-    case "fix":
-        fputs("MSL: Running full fix — cleaning setup and re-signing binary\n", stderr)
-
-        // 1. Stop daemon if running
-        let daemonState = DaemonState(dataDir: dataDir)
-        if daemonState.isRunning() {
-            let client = IPCClient(path: "\(dataDir)/msld.sock")
-            if let req = try? JSONSerialization.data(withJSONObject: ["cmd": "stop"]) {
-                _ = try? client.send(request: req)
-            }
-            for _ in 0..<50 {
-                if !daemonState.isRunning() { break }
-                usleep(100_000)
-            }
-        }
-
-        // 2. Delete everything in .msl except arch.img and the auth token.
-        //    The token is paired with the guest inside arch.img; regenerating
-        //    only the host side would break auth.
-        let fileManager = FileManager.default
-        if let items = try? fileManager.contentsOfDirectory(atPath: dataDir) {
-            for item in items {
-                if item == "arch.img" || item == "token" { continue }
-                let path = "\(dataDir)/\(item)"
-                try? fileManager.removeItem(atPath: path)
-            }
-        }
-
-        // 3. Re-run setup keeping the disk
-        let (ds, rs, cc, _) = parseSetupFlags(args)
-        do {
-            try ensureSetup(diskSizeGB: ds, ramSizeGB: rs, cpuCores: cc, keepDisk: true)
-        } catch {
-            fputs("MSL: Setup failed: \(error.localizedDescription)\n", stderr)
-            exit(1)
-        }
-
-        // 4. Re-sign binary
-        do {
-            try fixEntitlements()
         } catch {
             fputs("MSL: \(error.localizedDescription)\n", stderr)
             exit(1)
