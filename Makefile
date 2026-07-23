@@ -29,7 +29,7 @@ all: $(VERSION_FILE) $(PRODUCT) $(GUEST) sign
 # the correct version before invoking make sign.
 $(VERSION_FILE):
 	@if test -d .git; then \
-	  GIT_VERSION=$$(git describe --tags --dirty --always 2>/dev/null | sed 's/^v//'); \
+	  GIT_VERSION=$$(git describe --tags --always 2>/dev/null | sed 's/^v//'); \
 	  echo 'import Foundation' > $(VERSION_FILE); \
 	  echo "let MSLVersion = \"$$GIT_VERSION\"" >> $(VERSION_FILE); \
 	  echo "  -> Version: $$(grep MSLVersion $(VERSION_FILE) | sed 's/.*"\(.*\)"/\1/')"; \
