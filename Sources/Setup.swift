@@ -924,7 +924,7 @@ private func ensureMke2fs() throws -> String {
     if let p = findMke2fs() { return p }
     print("  Installing e2fsprogs...")
     fflush(stdout)
-    shell("brew install e2fsprogs 2>/dev/null", quiet: true)
+    shell("HOMEBREW_NO_INTERACTIVE=1 brew install e2fsprogs </dev/null 2>/dev/null", quiet: true)
     if let p = findMke2fs() { return p }
     throw MslError("mke2fs not found — install e2fsprogs via 'brew install e2fsprogs'")
 }
@@ -1075,7 +1075,7 @@ private func ensureXQuartz() {
     if findXQuartzApp() == nil {
         print("  Installing XQuartz (for GUI display forwarding)...")
         fflush(stdout)
-        shell("brew install --cask xquartz 2>&1", quiet: true)
+        shell("HOMEBREW_NO_INTERACTIVE=1 brew install --cask xquartz </dev/null 2>&1", quiet: true)
         if findXQuartzApp() == nil {
             print("  warning: XQuartz not found — install manually from https://www.xquartz.org")
             print("           GUI apps from the VM won't display until XQuartz is installed.")
